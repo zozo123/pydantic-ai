@@ -1,8 +1,8 @@
-"""Public `BoatSandbox` capability tests, over the fake Boat API.
+"""Public `BoatSandbox` capability tests, over the fake Boat SDK.
 
 They drive the capability through `Agent` runs and its own methods. They are not VCR tests: what
-they pin is which client a run opens and closes, and which sandbox a run creates or attaches to,
-which no recorded exchange shows.
+they pin is which sandbox a run creates or attaches to, and with which SDK client, which no recorded
+exchange shows.
 """
 
 from __future__ import annotations
@@ -12,7 +12,9 @@ from collections.abc import Callable
 from pathlib import Path
 
 import anyio
+import boat_sdk
 import pytest
+from boat_sdk.exceptions import ServiceException
 
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UserError
@@ -26,9 +28,10 @@ from pydantic_ai.workspaces import (
     Workspace,
     WorkspaceReadOnlyError,
     WorkspaceRef,
+    WorkspaceTimeoutError,
     WorkspaceUnavailableError,
 )
-from pydantic_ai_harness.boat_sandbox import BoatAPIError, BoatSandbox, BoatSandboxBackend
+from pydantic_ai_harness.boat_sandbox import BoatSandbox, BoatSandboxBackend
 from pydantic_ai_harness.coder import Coder
 
 from .._tool_calls import call_tools
@@ -36,7 +39,7 @@ from .fake_boat import FakeBoat, FakeSandbox, boat_error
 
 pytestmark = pytest.mark.anyio(backends=['asyncio'])
 
-_AUTH = 'Boat rejected the credentials. Set BOAT_API_KEY, or pass a configured `httpx.AsyncClient` as `client=`.'
+_AUTH = 'Boat rejected the credentials. Set BOAT_API_KEY, or pass a configured `boat_sdk.BoatApi` as `client=`.'
 
 
 def _ctx() -> RunContext[None]:
@@ -46,6 +49,17 @@ def _ctx() -> RunContext[None]:
 def only(fake: FakeBoat) -> FakeSandbox:
     [sandbox] = fake.sandboxes.values()
     return sandbox
+
+
+def sdk_client(api_key: str) -> boat_sdk.BoatApi:
+    """An SDK client as an application builds one to pass as `client=`; the fake answers it."""
+    return boat_sdk.BoatApi(boat_sdk.ApiClient(boat_sdk.Configuration(access_token=api_key)))
+
+
+async def until(condition: Callable[[], bool]) -> None:
+    with anyio.fail_after(10):
+        while not condition():
+            await anyio.sleep(0.001)
 
 
 def test_capability_repr_hides_command_environment() -> None:
@@ -130,7 +144,7 @@ async def test_destroy_rejects_a_foreign_or_blank_ref(fake_boat: FakeBoat) -> No
         await BoatSandbox[None]().destroy(WorkspaceRef(provider='other', id='x'))
     with pytest.raises(ValueError, match=r'^Boat workspace ref id cannot be empty$'):
         await BoatSandbox[None]().destroy(WorkspaceRef(provider='boat', id=' '))
-    assert fake_boat.opened_clients == 0
+    assert (fake_boat.clients, fake_boat.calls) == ([], [])
 
 
 async def test_destroy_deletes_a_stopped_sandbox_without_resuming_it(fake_boat: FakeBoat) -> None:
@@ -139,41 +153,36 @@ async def test_destroy_deletes_a_stopped_sandbox_without_resuming_it(fake_boat: 
     await capability.destroy(WorkspaceRef(provider='boat', id=existing.id))
     assert existing.id not in fake_boat.sandboxes
     assert existing.resume_calls == 0
-    # Boat deletes only with the target's ID repeated in a header.
-    [delete] = [call.request for call in fake_boat.calls if call.route == 'delete']
-    assert delete.headers['x-ascii-confirm-delete'] == existing.id
+    # Boat deletes only with the target's ID repeated as the confirmation.
+    [delete] = [call.arguments for call in fake_boat.calls if call.route == 'delete']
+    assert delete['confirm'] == existing.id
     # A sandbox already deleted, or one Boat never knew, is already gone.
     await capability.destroy(WorkspaceRef(provider='boat', id=existing.id))
     await capability.destroy(WorkspaceRef(provider='boat', id='bx_unknown'))
-    # Each call opened its own client and closed it.
-    assert (fake_boat.opened_clients, fake_boat.closed_clients) == (3, 3)
+    assert fake_boat.routes() == ['delete', 'delete', 'delete']
 
 
 async def test_destroy_translates_rejected_credentials_and_propagates_transient_errors(fake_boat: FakeBoat) -> None:
     existing = fake_boat.sandbox()
     ref = WorkspaceRef(provider='boat', id=existing.id)
-    fake_boat.errors['delete'] = [
-        boat_error(401, 'unauthorized', 'expired token secret-value'),
-        boat_error(503, 'out_of_capacity', 'No capacity.'),
-    ]
+    refused = boat_error(503, 'out_of_capacity', 'No capacity.')
+    fake_boat.errors['delete'] = [boat_error(401, 'unauthorized', 'expired token secret-value'), refused]
     with pytest.raises(WorkspaceUnavailableError) as exc_info:
         await BoatSandbox[None]().destroy(ref)
     assert str(exc_info.value) == f'Credential expired. {_AUTH}'
-    with pytest.raises(BoatAPIError) as transient:
+    with pytest.raises(ServiceException) as transient:
         await BoatSandbox[None]().destroy(ref)
-    assert transient.value.status == 503
+    assert transient.value is refused
     assert existing.id in fake_boat.sandboxes
-    # The client each call opened is closed on the way out of a failure too.
-    assert (fake_boat.opened_clients, fake_boat.closed_clients) == (2, 2)
 
 
-async def test_destroy_with_a_supplied_client_leaves_it_open(fake_boat: FakeBoat) -> None:
+async def test_destroy_with_a_supplied_client_uses_it(fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch) -> None:
     existing = fake_boat.sandbox()
-    client = fake_boat.supplied_client()
+    client = sdk_client(fake_boat.api_key)
+    monkeypatch.delenv('BOAT_API_KEY')
     await BoatSandbox[None](client=client).destroy(WorkspaceRef(provider='boat', id=existing.id))
     assert existing.id not in fake_boat.sandboxes
-    assert not client.is_closed
-    assert fake_boat.opened_clients == 0
+    assert fake_boat.clients == [client]
 
 
 async def test_agent_without_workspace_use_does_not_create(fake_boat: FakeBoat) -> None:
@@ -247,7 +256,7 @@ async def _touch(ctx: RunContext[None]) -> str:
     return 'ok'
 
 
-async def test_a_cancelled_run_closes_its_client_after_stopping_the_command(fake_boat: FakeBoat) -> None:
+async def test_a_cancelled_run_stops_its_command(fake_boat: FakeBoat) -> None:
     async def long_command(ctx: RunContext[None]) -> str:
         return (await ctx.workspace.run(['sleep', '30'])).stdout
 
@@ -255,95 +264,58 @@ async def test_a_cancelled_run_closes_its_client_after_stopping_the_command(fake
         TestModel(call_tools=['long_command']), deps_type=type(None), tools=[long_command], capabilities=[BoatSandbox()]
     )
     task = asyncio.create_task(agent.run('go'))
-    with anyio.fail_after(10):
-        await fake_boat.reached['status'].wait()
+    await until(fake_boat.reached['follow'].is_set)
     task.cancel()
-    # Promptly: the run's client close must not wait on the command it is cancelling.
     with anyio.fail_after(10), pytest.raises(asyncio.CancelledError):
         await task
-    assert fake_boat.closed_clients == 1
     [command] = only(fake_boat).commands.values()
     assert command.stopped and command.process.poll() is not None
 
 
-async def test_a_run_closes_the_client_it_opened_and_the_result_workspace_reopens(fake_boat: FakeBoat) -> None:
+async def test_the_result_workspace_keeps_working_after_the_run(fake_boat: FakeBoat) -> None:
     agent = Agent(TestModel(call_tools=['_touch']), deps_type=type(None), tools=[_touch], capabilities=[BoatSandbox()])
     result = await agent.run('go')
-    # The run keeps one client across its operations and closes it at the end.
-    assert (fake_boat.opened_clients, fake_boat.closed_clients) == (1, 1)
-
-    # After the run nothing would close the backend, so each operation closes its own client:
-    # resolving the relative path against the working directory, then reading the file.
+    # The run leaves nothing to close: the process's one SDK client keeps serving its sandbox.
     assert await result.workspace.read_bytes('note') == b'kept'
-    assert (fake_boat.opened_clients, fake_boat.closed_clients) == (3, 3)
+    assert len(fake_boat.clients) == 1
     assert len(fake_boat.create_bodies) == 1
 
 
-async def test_a_backend_used_outside_a_run_closes_its_client_after_each_operation(fake_boat: FakeBoat) -> None:
+async def test_a_backend_rebuilt_from_its_ref_reaches_the_same_sandbox(fake_boat: FakeBoat) -> None:
     # What a Temporal activity does: rebuild the backend from the ref, use it, and drop it.
     backend = BoatSandbox[None]().get_workspace(_ctx(), ref=None)
     assert isinstance(backend, BoatSandboxBackend)
     path = f'{await backend.working_dir()}/note'
-    assert (fake_boat.opened_clients, fake_boat.closed_clients) == (1, 1)
     await backend.write_bytes(path, b'hi')
-    assert (fake_boat.opened_clients, fake_boat.closed_clients) == (2, 2)
-
     attached = BoatSandbox[None]().get_workspace(_ctx(), ref=backend.ref)
     assert isinstance(attached, BoatSandboxBackend)
-    # One operation, however many requests it makes, and concurrent operations share one client,
-    # closed once the last of them ends.
     first, second = await asyncio.gather(attached.read_bytes(path), attached.exists(path))
     assert (first, second) == (b'hi', True)
-    assert (fake_boat.opened_clients, fake_boat.closed_clients) == (3, 3)
-
-
-async def test_a_stop_a_repeated_cancellation_leaves_running_is_an_operation_of_its_own(fake_boat: FakeBoat) -> None:
-    # Outside a run the client closes after each operation; the stop keeps it open until Boat answers.
-    backend = BoatSandbox[None]().get_workspace(_ctx(), ref=None)
-    assert isinstance(backend, BoatSandboxBackend)
-    await backend.working_dir()
-    release = fake_boat.gates['kill'] = asyncio.Event()
-    task = asyncio.create_task(backend.run(['sleep', '30']))
-    with anyio.fail_after(10):
-        await fake_boat.reached['status'].wait()
-        task.cancel()
-        await fake_boat.reached['kill'].wait()
-        # The second cancellation ends the run's wait for the stop, which keeps going.
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert fake_boat.closed_clients == 1
-        release.set()
-        while fake_boat.closed_clients < 2:
-            await anyio.sleep(0.001)
-    [command] = only(fake_boat).commands.values()
-    assert command.stopped
+    assert len(fake_boat.clients) == 1
+    assert len(fake_boat.create_bodies) == 1
 
 
 @pytest.mark.parametrize('anyio_backend', ['trio'])
-async def test_trio_is_refused_before_any_boat_call(fake_boat: FakeBoat) -> None:
-    """The backend finishes creation and command cleanup on asyncio tasks, so Trio gets a clear `UserError`."""
-    message = (
-        r'^Boat needs the asyncio event loop: the backend finishes sandbox creation and command cleanup '
-        r'on asyncio tasks of its own\.$'
-    )
+async def test_trio_runs_commands_files_and_timeouts(fake_boat: FakeBoat) -> None:
+    """The SDK runs in worker threads and holds no event loop state, so the backend works on Trio too."""
     backend = BoatSandbox[None]().get_workspace(_ctx(), ref=None)
     assert isinstance(backend, BoatSandboxBackend)
-    with pytest.raises(UserError, match=message):
-        await backend.run(['true'])
-    with pytest.raises(UserError, match=message):
-        await backend.read_bytes('/home/user/file')
-    with pytest.raises(UserError, match=message):
-        await backend.working_dir()
-    with pytest.raises(UserError, match=message):
-        await BoatSandbox[None]().destroy(WorkspaceRef(provider='boat', id='bx_target'))
-    await backend.aclose()
-    assert fake_boat.opened_clients == 0
+    assert (await backend.run(['echo', 'trio'])).stdout == 'trio\n'
+    path = f'{await backend.working_dir()}/note'
+    await backend.write_bytes(path, b'on trio')
+    assert await backend.read_bytes(path) == b'on trio'
+    with anyio.fail_after(10), pytest.raises(WorkspaceTimeoutError):
+        await backend.run(['sleep', '30'], timeout=0.05)
+    stopped = [command for command in only(fake_boat).commands.values() if command.stopped]
+    assert len(stopped) == 1
+    assert backend.ref is not None
+    await BoatSandbox[None]().destroy(backend.ref)
+    assert fake_boat.sandboxes == {}
 
 
 @pytest.mark.parametrize('supplied', ['client', 'workspace'])
-async def test_a_run_leaves_a_supplied_client_or_workspace_open(fake_boat: FakeBoat, supplied: str) -> None:
-    client = fake_boat.supplied_client() if supplied == 'client' else None
+async def test_a_run_uses_a_supplied_client_or_workspace(fake_boat: FakeBoat, supplied: str) -> None:
+    client = sdk_client(fake_boat.api_key) if supplied == 'client' else None
     workspace = BoatSandboxBackend() if supplied == 'workspace' else None
     agent = Agent(
         TestModel(call_tools=['_touch']),
@@ -351,18 +323,17 @@ async def test_a_run_leaves_a_supplied_client_or_workspace_open(fake_boat: FakeB
         tools=[_touch],
         capabilities=[BoatSandbox[None](client=client)],
     )
-    await agent.run('go', workspace=workspace)
-    assert fake_boat.closed_clients == 0
-    assert client is None or not client.is_closed
+    result = await agent.run('go', workspace=workspace)
+    assert (only(fake_boat).home / 'note').read_bytes() == b'kept'
+    assert workspace is None or result.workspace.ref == workspace.ref
+    assert len(fake_boat.clients) == 1
 
 
-async def test_a_child_run_leaves_the_parent_runs_client_open(fake_boat: FakeBoat) -> None:
+async def test_a_child_run_works_in_the_parent_runs_sandbox(fake_boat: FakeBoat) -> None:
     child = Agent(TestModel(call_tools=['_touch']), deps_type=type(None), tools=[_touch], capabilities=[BoatSandbox()])
-    closed_after_child: list[int] = []
 
     async def delegate(ctx: RunContext[None]) -> str:
         await child.run('go', workspace=ctx.workspace)
-        closed_after_child.append(fake_boat.closed_clients)
         return 'ok'
 
     parent = Agent(
@@ -372,9 +343,8 @@ async def test_a_child_run_leaves_the_parent_runs_client_open(fake_boat: FakeBoa
         capabilities=[BoatSandbox()],
     )
     await parent.run('go')
-    assert closed_after_child == [0]
-    assert fake_boat.closed_clients == 1
     assert len(fake_boat.create_bodies) == 1
+    assert fake_boat.routes().count('write') == 2
 
 
 async def test_coder_works_in_the_sandbox(fake_boat: FakeBoat) -> None:

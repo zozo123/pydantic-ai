@@ -1,25 +1,32 @@
-"""Protocol and API-boundary tests for Boat sandboxes, over the fake Boat API.
+"""Protocol and SDK-boundary tests for Boat sandboxes, over the fake Boat SDK.
 
 They are not VCR tests: what they pin is how the backend reacts to answers Boat gives only on a bad
-day (lost replies, refusals, a sandbox stopped or deleted mid-run, retry signals), which a recording
-of a working session does not hold. The fake serves Boat's real envelopes and runs real commands.
+day (lost replies, refusals, a sandbox stopped or deleted mid-run, a command whose result is lost),
+which a recording of a working session does not hold. The fake answers with the SDK's own models
+and exceptions, and runs real commands.
 """
 
 from __future__ import annotations
 
 import asyncio
 import errno
+import importlib
 import logging
 import os
 import pickle
 import re
+import sys
+import threading
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 import anyio
-import httpx
+import boat_sdk
 import pytest
+import urllib3
+from boat_sdk.exceptions import ApiException, ServiceException
 
 from pydantic_ai.workspaces import (
     CommandResult,
@@ -29,19 +36,29 @@ from pydantic_ai.workspaces import (
     WorkspaceTimeoutError,
     WorkspaceUnavailableError,
 )
-from pydantic_ai_harness.boat_sandbox import BoatAPIError, BoatSandbox, BoatSandboxBackend
+from pydantic_ai_harness.boat_sandbox import BoatSandbox, BoatSandboxBackend
 
-# The factory the backend opens its own clients with; it is not exported, and a test needs it to
-# check the client that reaches Boat.
-from pydantic_ai_harness.boat_sandbox._api import open_client
-
-from .fake_boat import FakeBoat, FakeCommand, FakeSandbox, boat_error, boat_ok
+from .fake_boat import (
+    Answer,
+    FakeBoat,
+    FakeCommand,
+    FakeSandbox,
+    Frames,
+    answered,
+    boat_error,
+    detached,
+    finished,
+    gave_up_reading,
+    lost_reply,
+    unreachable,
+)
 
 pytestmark = pytest.mark.anyio(backends=['asyncio'])
 
 _BACKEND = 'pydantic_ai_harness.boat_sandbox._backend'
-_AUTH = 'Boat rejected the credentials. Set BOAT_API_KEY, or pass a configured `httpx.AsyncClient` as `client=`.'
+_AUTH = 'Boat rejected the credentials. Set BOAT_API_KEY, or pass a configured `boat_sdk.BoatApi` as `client=`.'
 _FRESH = "Pass `workspace='new'` to start a fresh sandbox."
+_WRAPPER = 'exec sh -c \'"$@" </dev/null; exit $?\' sh'
 
 
 async def started(backend: BoatSandboxBackend) -> BoatSandboxBackend:
@@ -60,89 +77,27 @@ def only_command(fake: FakeBoat) -> FakeCommand:
     return command
 
 
-def unmarked(command: object) -> str:
-    assert isinstance(command, str)
-    return re.sub(r'pydantic-ai-[0-9a-f]{32}', 'MARK', command)
-
-
-def routes(fake: FakeBoat) -> list[str]:
-    return [call.route for call in fake.calls]
-
-
 async def until(condition: Callable[[], bool]) -> None:
     with anyio.fail_after(10):
         while not condition():
             await anyio.sleep(0.001)
 
 
-def status(*, running: bool, exit_code: int | None = None, stdout: str = '', stderr: str = '') -> httpx.Response:
-    """Boat's answer to a check of a detached command."""
-    return boat_ok(
-        'command.status',
-        success=True,
-        processId=1,
-        status='running' if running else 'exited',
-        running=running,
-        known=True,
-        exitCode=exit_code,
-        stdout=stdout,
-        stderr=stderr,
-        stdoutTruncated=False,
-        stderrTruncated=False,
-    )
-
-
-def finished(
-    *, exit_code: int = 0, stdout: str = '', stderr: str = '', timed_out: bool = False, truncated: bool = False
-) -> httpx.Response:
-    """Boat's answer to a synchronous command."""
-    return boat_ok(
-        'command.finished',
-        success=exit_code == 0,
-        exitCode=exit_code,
-        stdout=stdout,
-        stderr=stderr,
-        stdoutTruncated=truncated,
-        stderrTruncated=False,
-        timedOut=timed_out,
-    )
-
-
-def ip_limited(*, retry_after: float) -> httpx.Response:
-    """Boat's answer once one IP address sent more than 1,000 requests in a minute, with the wait in the body."""
-    body = boat_error(429, 'IP_RATE_LIMIT_EXCEEDED', 'Too many requests.').json()
-    return httpx.Response(429, json={**body, 'retryAfter': retry_after})
-
-
-def record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """The delays slept from now on, each returned at once instead of waited out."""
-    delays: list[float] = []
-    sleep = anyio.sleep
-
-    async def record(delay: float) -> None:
-        delays.append(delay)
-        await sleep(0)
-
-    monkeypatch.setattr(anyio, 'sleep', record)
-    return delays
-
-
-def without_repeats(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Close the window in which a call that is safe to repeat is sent again, so its first failure surfaces."""
-    monkeypatch.setattr('pydantic_ai_harness.boat_sandbox._api._RETRY_WINDOW', 0)
-
-
 def advance_clock(monkeypatch: pytest.MonkeyPatch) -> Callable[[float], None]:
     """A function that moves the clock the backend reads forward by some seconds, without waiting them out."""
     offset = 0.0
-    now = anyio.current_time
 
     def advance(seconds: float) -> None:
         nonlocal offset
         offset += seconds
 
-    monkeypatch.setattr(anyio, 'current_time', lambda: now() + offset)
+    monkeypatch.setattr(f'{_BACKEND}.monotonic', lambda: time.monotonic() + offset)
     return advance
+
+
+def sdk_client(api_key: str) -> boat_sdk.BoatApi:
+    """An SDK client as an application builds one to pass as `client=`; the fake answers it."""
+    return boat_sdk.BoatApi(boat_sdk.ApiClient(boat_sdk.Configuration(access_token=api_key)))
 
 
 def unavailable(sandbox_id: str) -> str:
@@ -189,9 +144,17 @@ def stopped(sandbox_id: str) -> str:
 def test_invalid_settings_fail_at_construction(
     build: Callable[[], object], error: type[Exception], message: str
 ) -> None:
-    # No fake: the autouse tripwire fails the test if construction reached for a Boat client.
+    # No fake: the autouse tripwire fails the test if construction touched the SDK.
     with pytest.raises(error, match=message):
         build()
+
+
+def test_missing_boat_extra_has_an_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, 'boat_sdk', None)
+    for name in [name for name in sys.modules if name.startswith('pydantic_ai_harness.boat_sandbox')]:
+        monkeypatch.delitem(sys.modules, name)
+    with pytest.raises(ImportError, match=r'^Install `pydantic-ai-harness\[boat\]` to use BoatSandbox\.$'):
+        importlib.import_module('pydantic_ai_harness.boat_sandbox')
 
 
 class TestCreation:
@@ -213,11 +176,12 @@ class TestCreation:
     async def test_creation_sends_the_settings_and_keeps_the_account_credentials_out(
         self, fake_boat: FakeBoat, build: Callable[[], BoatSandboxBackend], body: dict[str, object]
     ) -> None:
+        # Only what the backend sets is sent: none of the SDK's own defaults, such as an `environment`.
         fake_boat.snapshots.add('base')
         backend = await started(build())
         assert fake_boat.create_bodies == [body]
-        [create] = [call.request for call in fake_boat.calls if call.route == 'create']
-        assert re.fullmatch(r'pydantic-ai-[0-9a-f]{32}', create.headers['idempotency-key'])
+        [create] = [call.arguments for call in fake_boat.calls if call.route == 'create']
+        assert re.fullmatch(r'pydantic-ai-[0-9a-f]{32}', str(create['idempotency_key']))
         assert backend.ref == WorkspaceRef(provider='boat', id=only(fake_boat).id)
 
     async def test_a_new_sandbox_gets_its_working_dir_and_an_attached_one_does_not(
@@ -230,15 +194,14 @@ class TestCreation:
         # Logged at creation, so a sandbox whose run ended before its ref was stored can be found.
         assert caplog.messages == [f'Created Boat sandbox {sandbox.id}']
         assert await backend.working_dir() == str(directory)
-        mkdir = f'exec sh -c \': MARK; "$@" </dev/null; exit $?\' sh mkdir -p -- {directory}'
-        made = [body for body in fake_boat.bodies('run') if 'mkdir' in str(body['command'])]
-        assert [{**body, 'command': unmarked(body['command'])} for body in made] == [
-            {'command': mkdir, 'timeoutSeconds': 30}
+        made = [body for body in fake_boat.bodies('run') if 'mkdir' in str(body)]
+        assert made == [
+            {'command': f'{_WRAPPER} mkdir -p -- {directory}', 'timeoutSeconds': 30, 'detached': False, 'stream': False}
         ]
 
         attached = await started(BoatSandboxBackend(ref=backend.ref, working_dir=str(directory)))
         assert await attached.working_dir() == str(directory)
-        assert [body for body in fake_boat.bodies('run') if 'mkdir' in str(body['command'])] == made
+        assert [body for body in fake_boat.bodies('run') if 'mkdir' in str(body)] == made
         assert len(fake_boat.create_bodies) == 1
 
     async def test_a_failed_working_dir_is_retried_by_the_next_operation(
@@ -259,31 +222,32 @@ class TestCreation:
         assert fake_boat.bodies('start') == []
         blocker.unlink()
         assert await backend.working_dir() == str(directory)
-        assert len([body for body in fake_boat.bodies('run') if 'mkdir' in str(body['command'])]) == 2
+        assert len([body for body in fake_boat.bodies('run') if 'mkdir' in str(body)]) == 2
         assert len(fake_boat.create_bodies) == 1
 
     async def test_a_lost_creation_reply_recovers_the_accepted_sandbox(self, fake_boat: FakeBoat) -> None:
         fake_boat.lost_replies['create'] = 1
         backend = await started(BoatSandboxBackend())
         assert backend.ref == WorkspaceRef(provider='boat', id=only(fake_boat).id)
-        keys = [call.request.headers['idempotency-key'] for call in fake_boat.calls if call.route == 'create']
+        keys = [call.arguments['idempotency_key'] for call in fake_boat.calls if call.route == 'create']
         assert len(keys) == 2 and len(set(keys)) == 1
 
     async def test_a_creation_still_in_progress_elsewhere_is_waited_for(self, fake_boat: FakeBoat) -> None:
         message = 'A request with this Idempotency-Key is still in progress.'
         fake_boat.errors['create'] = [boat_error(409, 'idempotency_in_progress', message)]
         await started(BoatSandboxBackend())
-        assert routes(fake_boat).count('create') == 2
+        assert fake_boat.routes().count('create') == 2
         assert len(fake_boat.sandboxes) == 1
 
     async def test_a_retried_creation_finds_the_sandbox_a_lost_reply_left(self, fake_boat: FakeBoat) -> None:
         # The sandbox is created but its reply is lost, and the repeat that would recover it is refused.
-        fake_boat.errors['create'] = [None, boat_error(503, 'no_ready_machine', 'No machine is ready.')]
+        refused = boat_error(503, 'no_ready_machine', 'No machine is ready.')
+        fake_boat.errors['create'] = [None, refused]
         fake_boat.lost_replies['create'] = 1
         backend = BoatSandboxBackend()
-        with pytest.raises(BoatAPIError) as exc_info:
+        with pytest.raises(ServiceException) as exc_info:
             await backend.working_dir()
-        assert (exc_info.value.status, exc_info.value.code) == (503, 'no_ready_machine')
+        assert exc_info.value is refused
         assert backend.ref is None
         # The next operation repeats the creation under the same key instead of starting a second sandbox.
         await backend.working_dir()
@@ -312,7 +276,7 @@ class TestCreation:
             ),
             pytest.param(
                 (409, 'idempotency_key_reused', 'This Idempotency-Key was already used with a different request body.'),
-                'Could not start Boat sandbox: Boat API returned HTTP 409 (idempotency_key_reused): '
+                'Could not start Boat sandbox: Boat answered HTTP 409 (idempotency_key_reused): '
                 'This Idempotency-Key was already used with a different request body.',
                 id='key-reused',
             ),
@@ -325,7 +289,7 @@ class TestCreation:
         with pytest.raises(WorkspaceUnavailableError) as exc_info:
             await BoatSandboxBackend().run(['true'])
         assert str(exc_info.value) == message
-        assert isinstance(exc_info.value.__cause__, BoatAPIError)
+        assert isinstance(exc_info.value.__cause__, ApiException)
         assert not fake_boat.sandboxes
 
     @pytest.mark.parametrize(
@@ -333,15 +297,15 @@ class TestCreation:
         [
             pytest.param(
                 lambda: BoatSandboxBackend(snapshot='nope'),
-                'Could not start Boat sandbox: Boat API returned HTTP 404 (snapshot_not_found): '
+                'Could not start Boat sandbox: Boat answered HTTP 404 (snapshot_not_found): '
                 'No named snapshot "nope". Run boat snapshots to list yours.',
                 id='unknown-snapshot',
             ),
+            # A size outside `MachineType`, as an untyped caller can pass: the SDK refuses it before sending it.
             pytest.param(
-                # A size outside `MachineType`, as an untyped caller can pass.
                 lambda: BoatSandboxBackend(machine_type='huge'),  # pyright: ignore[reportArgumentType]
-                'Could not start Boat sandbox: Boat API returned HTTP 400 (invalid_type): '
-                'type must be one of small, default, large, xlarge',
+                'Could not start Boat sandbox: 1 validation error for CreateSandboxRequest\ntype\n'
+                "  Value error, must be one of enum values ('small', 'default', 'large', 'xlarge')",
                 id='unknown-machine-type',
             ),
         ],
@@ -352,61 +316,54 @@ class TestCreation:
         # No retry can fix them, so the run ends rather than being retried by a durable engine.
         with pytest.raises(WorkspaceUnavailableError) as exc_info:
             await build().run(['true'])
-        assert str(exc_info.value) == message
+        assert str(exc_info.value).startswith(message)
         assert not fake_boat.sandboxes
 
     @pytest.mark.parametrize(
-        ('answer', 'status', 'code'),
+        'answer',
         [
-            pytest.param(lambda: boat_error(429, 'rate_limited', 'Too many starts.'), 429, 'rate_limited', id='429'),
-            pytest.param(lambda: boat_error(503, 'out_of_capacity', 'No capacity.'), 503, 'out_of_capacity', id='503'),
+            pytest.param(lambda: boat_error(429, 'rate_limited', 'Too many starts.'), id='429'),
+            pytest.param(lambda: boat_error(503, 'out_of_capacity', 'No capacity.'), id='503'),
+            # A proxy's answer, which is not Boat's envelope.
             pytest.param(
-                lambda: httpx.Response(502, text='<html>Bad Gateway</html>'), 502, 'invalid_response', id='html'
+                lambda: ServiceException(status=502, reason='Bad Gateway', body='<html>Bad Gateway</html>'),
+                id='not-json',
             ),
-            pytest.param(lambda: httpx.Response(202, json={'ok': True}), 202, 'invalid_response', id='malformed-202'),
         ],
     )
     async def test_a_transient_creation_failure_propagates_unchanged(
-        self, fake_boat: FakeBoat, answer: Callable[[], httpx.Response], status: int, code: str
+        self, fake_boat: FakeBoat, answer: Callable[[], ApiException]
     ) -> None:
-        fake_boat.errors['create'] = [answer()]
-        with pytest.raises(BoatAPIError) as exc_info:
+        # So a durable engine retries it.
+        fake_boat.errors['create'] = [error := answer()]
+        with pytest.raises(ApiException) as exc_info:
             await BoatSandboxBackend().run(['true'])
-        assert (exc_info.value.status, exc_info.value.code) == (status, code)
-        if code == 'invalid_response':
-            assert (
-                str(exc_info.value) == f'Boat API returned HTTP {status} (invalid_response): Unexpected Boat response'
-            )
+        assert exc_info.value is error
 
     async def test_a_transient_failure_survives_pickling(self, fake_boat: FakeBoat) -> None:
         # Durable engines and process pools pickle the errors an operation raises.
-        body = boat_error(503, 'out_of_capacity', 'No capacity.', retryable=True).json()
-        fake_boat.errors['create'] = [httpx.Response(503, json={**body, 'retryAfterSeconds': 120})]
-        with pytest.raises(BoatAPIError) as exc_info:
+        fake_boat.errors['create'] = [boat_error(503, 'out_of_capacity', 'No capacity.', retryable=True)]
+        with pytest.raises(ServiceException) as exc_info:
             await BoatSandboxBackend().run(['true'])
         error = exc_info.value
         restored = pickle.loads(pickle.dumps(error))
-        assert type(restored) is BoatAPIError
-        assert (restored.status, restored.code, restored.message, restored.retryable, restored.retry_after) == (
-            503,
-            'out_of_capacity',
-            'No capacity.',
-            True,
-            120,
-        )
-        assert str(restored) == str(error) == 'Boat API returned HTTP 503 (out_of_capacity): No capacity.'
+        assert type(restored) is ServiceException
+        assert vars(restored) == vars(error)
+        assert str(restored) == str(error)
 
-    async def test_rejected_credentials_do_not_expose_the_key(self, fake_boat: FakeBoat) -> None:
+    async def test_rejected_credentials_do_not_expose_the_key(
+        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         fake_boat.errors['create'] = [boat_error(401, 'unauthorized', 'expired token secret-value')]
         with pytest.raises(WorkspaceUnavailableError) as exc_info:
             await BoatSandboxBackend().working_dir()
         assert str(exc_info.value) == f'Credential expired. {_AUTH}'
-        # A key Boat no longer accepts: the request the backend built carries it, the error does not.
-        fake_boat.api_key = 'rotated-key'
+        # A key Boat no longer accepts: the client the backend built carries it, the error does not.
+        monkeypatch.setenv('BOAT_API_KEY', 'rotated-key-secret')
         with pytest.raises(WorkspaceUnavailableError) as exc_info:
             await BoatSandboxBackend().working_dir()
         assert str(exc_info.value) == f'Credentials rejected. {_AUTH}'
-        assert 'test-key' not in str(exc_info.value)
+        assert 'rotated-key-secret' not in str(exc_info.value)
 
     @pytest.mark.parametrize('key', [None, '  \n'])
     async def test_missing_api_key_is_unavailable(
@@ -419,74 +376,70 @@ class TestCreation:
         with pytest.raises(WorkspaceUnavailableError) as exc_info:
             await BoatSandboxBackend().run(['true'])
         assert str(exc_info.value) == (
-            'No Boat credentials found. Set BOAT_API_KEY, or pass a configured `httpx.AsyncClient` as `client=`.'
+            'No Boat credentials found. Set BOAT_API_KEY, or pass a configured `boat_sdk.BoatApi` as `client=`.'
         )
-        assert fake_boat.opened_clients == 0
-
-    async def test_the_client_opened_from_boat_api_key_authenticates_against_boats_api(
-        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The real factory, with the fake answering at the transport: its URL, header and timeout are what reach Boat."""
-        opened: list[httpx.AsyncClient] = []
-
-        def open_and_keep(api_key: str) -> httpx.AsyncClient:
-            opened.append(client := open_client(api_key))
-            return client
-
-        async def answer(transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
-            return await fake_boat.handle(request)
-
-        monkeypatch.setattr('pydantic_ai_harness.boat_sandbox._api.open_client', open_and_keep)
-        monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', answer)
-        monkeypatch.setenv('BOAT_API_KEY', f' {fake_boat.api_key}\n')
-        backend = BoatSandboxBackend()
-        # The fake refuses any request that is not to Boat's API URL with `Bearer test-key`.
-        assert (await backend.run(['echo', 'hi'])).stdout == 'hi\n'
-        [client] = opened
-        assert (str(client.base_url), client.timeout) == ('https://boat.dev/api/v1/', httpx.Timeout(30))
-        await backend.aclose()
-        assert client.is_closed
-
-    async def test_a_client_without_boats_url_fails_at_once(self) -> None:
-        # The request never leaves the client, so nothing was created: no retry, and no wait for the creation bound.
-        async with httpx.AsyncClient() as client:
-            backend = BoatSandboxBackend(client=client)
-            with anyio.fail_after(5), pytest.raises(httpx.UnsupportedProtocol):
-                await backend.run(['true'])
-        assert backend.ref is None
+        assert fake_boat.clients == []
 
     async def test_a_create_that_never_answers_is_transient(
         self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(f'{_BACKEND}._CREATE_TIMEOUT', 0.05)
-        fake_boat.gates['create'] = asyncio.Event()
+        monkeypatch.setattr(f'{_BACKEND}._CREATE_TIMEOUT', 0.0)
+        fake_boat.errors['create'] = [lost_reply()]
         backend = BoatSandboxBackend()
         with pytest.raises(TimeoutError) as exc_info:
             await backend.run(['true'])
         # The builtin, not a command timeout: a durable engine retries it.
         assert type(exc_info.value) is TimeoutError
         assert str(exc_info.value) == (
-            'Boat sandbox creation did not complete within 0.05s; the Boat control plane may be unreachable.'
+            'Boat sandbox creation did not complete within 0s; the Boat control plane may be unreachable.'
         )
         assert backend.ref is None
 
 
+class TestClients:
+    async def test_the_client_built_from_boat_api_key_is_shared_by_every_backend_with_that_key(
+        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('BOAT_API_KEY', f' {fake_boat.api_key}\n')
+        first, second = BoatSandboxBackend(), BoatSandboxBackend()
+        assert (await first.run(['echo', 'hi'])).stdout == 'hi\n'
+        assert (await second.run(['echo', 'hi'])).stdout == 'hi\n'
+        # One SDK client, for Boat's API and the key without its whitespace; nothing to close.
+        [client] = fake_boat.clients
+        assert client.api_key == fake_boat.api_key
+        assert (
+            client.sdk_client is not None and vars(client.sdk_client)['configuration'].host == 'https://boat.dev/api/v1'
+        )
+        assert len(fake_boat.sandboxes) == 2
+
+    async def test_a_supplied_client_is_used(self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = sdk_client(fake_boat.api_key)
+        monkeypatch.delenv('BOAT_API_KEY')
+        backend = BoatSandboxBackend(client=client)
+        assert (await backend.run(['echo', 'mine'])).stdout == 'mine\n'
+        assert fake_boat.clients == [client]
+
+
 class TestCancellationDuringCreation:
     async def test_native_cancellation_during_committed_creation_keeps_ref(self, fake_boat: FakeBoat) -> None:
-        gate = fake_boat.gates['create'] = asyncio.Event()
+        gate = fake_boat.gates['create'] = threading.Event()
         backend = BoatSandboxBackend()
         task = asyncio.create_task(backend.working_dir())
-        await fake_boat.reached['create'].wait()
+        await until(fake_boat.reached['create'].is_set)
         task.cancel()
         task.cancel()
         gate.set()
         with pytest.raises(asyncio.CancelledError):
             await task
+        # The creation finishes in its thread and records the sandbox; the next operation uses it.
+        await until(lambda: backend.ref is not None)
         assert backend.ref == WorkspaceRef(provider='boat', id=only(fake_boat).id)
+        await backend.working_dir()
+        assert len(fake_boat.create_bodies) == 1
 
     async def test_a_creation_failure_after_cancellation_is_not_reported_to_the_loop(self, fake_boat: FakeBoat) -> None:
         # Creation keeps going after the caller is cancelled, then Boat refuses it.
-        gate = fake_boat.gates['create'] = asyncio.Event()
+        gate = fake_boat.gates['create'] = threading.Event()
         fake_boat.errors['create'] = [boat_error(400, 'invalid_type', 'type must be one of small, default')]
         backend = BoatSandboxBackend()
         # What reaches the loop's exception handler, such as a failure reported as never retrieved.
@@ -496,13 +449,15 @@ class TestCancellationDuringCreation:
         loop.set_exception_handler(lambda _, context: errors.append(context))
         try:
             task = asyncio.create_task(backend.working_dir())
-            await fake_boat.reached['create'].wait()
+            await until(fake_boat.reached['create'].is_set)
             task.cancel()
             await asyncio.sleep(0)
             gate.set()
-            # The caller's cancellation wins; the refusal is retrieved, not reported.
+            # The caller's cancellation wins; the refusal is dropped, not reported.
             with pytest.raises(asyncio.CancelledError):
                 await task
+            await until(lambda: 'get' in fake_boat.routes() or not fake_boat.errors['create'])
+            await asyncio.sleep(0.05)
         finally:
             loop.set_exception_handler(previous)
         assert errors == []
@@ -511,12 +466,12 @@ class TestCancellationDuringCreation:
         self, fake_boat: FakeBoat, tmp_path: Path
     ) -> None:
         directory = tmp_path.resolve() / 'work'
-        gate = fake_boat.gates['create'] = asyncio.Event()
+        gate = fake_boat.gates['create'] = threading.Event()
         backend = BoatSandboxBackend(working_dir=str(directory))
         with anyio.CancelScope() as scope:
 
             async def cancel_once_created() -> None:
-                await fake_boat.reached['create'].wait()
+                await until(fake_boat.reached['create'].is_set)
                 scope.cancel()
                 gate.set()
 
@@ -524,18 +479,19 @@ class TestCancellationDuringCreation:
                 tasks.start_soon(cancel_once_created)
                 await backend.run(['true'])
         assert scope.cancelled_caught
+        # Acquiring the sandbox finished before the cancellation took effect, `working_dir` included;
+        # the command never started.
         assert backend.ref == WorkspaceRef(provider='boat', id=only(fake_boat).id)
-        # The cancelled call neither starts the command nor makes `working_dir`; the next operation does.
+        assert directory.is_dir()
         assert fake_boat.bodies('start') == []
-        assert not directory.exists()
         assert await backend.working_dir() == str(directory)
         assert len(fake_boat.create_bodies) == 1
 
     async def test_the_command_timeout_starts_once_the_sandbox_is_acquired(self, fake_boat: FakeBoat) -> None:
-        gate = fake_boat.gates['create'] = asyncio.Event()
+        gate = fake_boat.gates['create'] = threading.Event()
         # A command Boat finishes at once, so only acquiring the sandbox outlasts the timeout.
-        fake_boat.errors['start'] = [boat_ok('command.started', processId=4242)]
-        fake_boat.errors['status'] = [status(running=False, exit_code=0, stdout='ready\n')]
+        fake_boat.errors['start'] = [detached(4242)]
+        fake_boat.errors['follow'] = [Frames([{'type': 'stdout', 'data': 'ready\n'}, {'type': 'exit', 'exitCode': 0}])]
 
         async def release() -> None:
             await anyio.sleep(0.1)
@@ -554,15 +510,17 @@ class TestAttach:
         assert (await backend.run(['echo', 'resumed'])).stdout == 'resumed\n'
         assert existing.resume_calls == 1
         assert fake_boat.create_bodies == []
+        # Checked again until ready, and not extended: a resume sets the auto-stop deadline itself.
+        assert fake_boat.routes()[:4] == ['get', 'resume', 'get', 'start']
 
     async def test_operations_wait_until_a_starting_sandbox_is_ready(self, fake_boat: FakeBoat) -> None:
         # File calls sent to a starting sandbox can report an existing file as missing, so none is sent early.
-        fake_boat.boot_polls = 2
         existing = fake_boat.sandbox('provisioning')
+        existing.next_states = ['cloning', 'cloning']
         backend = BoatSandboxBackend(ref=WorkspaceRef(provider='boat', id=existing.id))
         assert await backend.exists(f'{existing.home}/missing') is False
         # The first operation on an attached sandbox extends its auto-stop.
-        assert routes(fake_boat)[:5] == ['get', 'get', 'get', 'update', 'run']
+        assert fake_boat.routes()[:5] == ['get', 'get', 'get', 'update', 'run']
 
     @pytest.mark.parametrize('operation', ['run', 'read_bytes', 'exists', 'working_dir'])
     async def test_a_missing_sandbox_remains_terminal(
@@ -595,29 +553,36 @@ class TestAttach:
             f'The Boat sandbox {existing.id!r} is in the {state!r} state and cannot be used. {_FRESH}'
         )
 
-    async def test_a_resumed_sandbox_is_checked_again_after_a_pause(
-        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(f'{_BACKEND}._READY_POLL', 0.5)
-        existing = fake_boat.sandbox('archived')
-        delays = record_sleeps(monkeypatch)
-        await BoatSandboxBackend(ref=WorkspaceRef(provider='boat', id=existing.id)).working_dir()
-        assert routes(fake_boat) == ['get', 'resume', 'get', 'run']
-        assert delays == [0.5]
+    async def test_a_sandbox_that_fails_while_starting_is_unavailable(self, fake_boat: FakeBoat) -> None:
+        existing = fake_boat.sandbox('provisioning')
+        existing.next_states = ['cloning', 'error']
+        with pytest.raises(WorkspaceUnavailableError) as exc_info:
+            await BoatSandboxBackend(ref=WorkspaceRef(provider='boat', id=existing.id)).working_dir()
+        assert str(exc_info.value) == (
+            f'The Boat sandbox {existing.id!r} stopped or failed while starting (Sandbox entered terminal state '
+            f'error). {_FRESH}'
+        )
 
     @pytest.mark.parametrize('code', ['sandbox_resuming', 'sandbox_stopping', 'sandbox_starting'])
     async def test_a_resume_refused_while_the_sandbox_changes_state_is_sent_again(
-        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch, code: str
+        self, fake_boat: FakeBoat, code: str
     ) -> None:
-        monkeypatch.setattr(f'{_BACKEND}._READY_POLL', 0.5)
         existing = fake_boat.sandbox('archived')
         fake_boat.errors['resume'] = [boat_error(409, code, 'The sandbox is changing state.')]
-        delays = record_sleeps(monkeypatch)
         backend = BoatSandboxBackend(ref=WorkspaceRef(provider='boat', id=existing.id))
         assert (await backend.run(['echo', 'resumed'])).stdout == 'resumed\n'
-        assert routes(fake_boat)[:5] == ['get', 'resume', 'get', 'resume', 'get']
-        assert delays[:2] == [0.5, 0.5]
+        assert fake_boat.routes()[:5] == ['get', 'resume', 'get', 'resume', 'get']
         assert existing.resume_calls == 1
+
+    async def test_a_resume_refused_until_the_bound_is_transient(
+        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(f'{_BACKEND}._CREATE_TIMEOUT', 0.0)
+        existing = fake_boat.sandbox('archived')
+        fake_boat.errors['resume'] = [boat_error(409, 'sandbox_stopping', 'The sandbox is changing state.')]
+        with pytest.raises(TimeoutError) as exc_info:
+            await BoatSandboxBackend(ref=WorkspaceRef(provider='boat', id=existing.id)).working_dir()
+        assert str(exc_info.value) == f'Resuming Boat sandbox {existing.id!r} did not complete within 0s.'
 
     @pytest.mark.parametrize(
         ('code', 'message'),
@@ -634,59 +599,42 @@ class TestAttach:
         with pytest.raises(WorkspaceUnavailableError) as exc_info:
             await BoatSandboxBackend(ref=WorkspaceRef(provider='boat', id=existing.id)).run(['true'])
         assert str(exc_info.value) == f'Could not resume Boat sandbox {existing.id!r}: {message}'
-        assert routes(fake_boat) == ['get', 'resume']
+        assert fake_boat.routes() == ['get', 'resume']
 
     async def test_attach_errors_are_translated_or_propagate(self, fake_boat: FakeBoat) -> None:
         existing = fake_boat.sandbox()
         ref = WorkspaceRef(provider='boat', id=existing.id)
-        offline = httpx.ConnectError('offline')
+        offline = unreachable()
         fake_boat.errors['get'] = [
             boat_error(400, 'invalid_request', 'Bad request.'),
             boat_error(401, 'unauthorized', 'unauthorized'),
-            boat_error(429, 'rate_limited', 'Too many requests.'),
+            limited := boat_error(429, 'rate_limited', 'Too many requests.'),
             offline,
         ]
         with pytest.raises(WorkspaceError) as refused:
             await BoatSandboxBackend(ref=ref).working_dir()
         assert type(refused.value) is WorkspaceError
         assert str(refused.value) == (
-            f'Could not attach to Boat sandbox {existing.id!r}: Boat API returned HTTP 400 (invalid_request): Bad request.'
+            f'Could not attach to Boat sandbox {existing.id!r}: Boat answered HTTP 400 (invalid_request): Bad request.'
         )
         with pytest.raises(WorkspaceUnavailableError, match=re.escape(_AUTH)):
             await BoatSandboxBackend(ref=ref).working_dir()
-        with pytest.raises(BoatAPIError) as limited:
+        with pytest.raises(ApiException) as raised_limit:
             await BoatSandboxBackend(ref=ref).working_dir()
-        assert limited.value.status == 429
-        with pytest.raises(httpx.ConnectError) as raised:
+        assert raised_limit.value is limited
+        with pytest.raises(urllib3.exceptions.MaxRetryError) as raised:
             await BoatSandboxBackend(ref=ref).working_dir()
         assert raised.value is offline
 
-    @pytest.mark.parametrize(
-        'answer',
-        [
-            pytest.param(lambda: httpx.Response(200, json={'ok': True, 'type': 'sandbox.info'}), id='malformed'),
-            pytest.param(lambda: httpx.Response(502, text='<html>Bad Gateway</html>'), id='not-json'),
-        ],
-    )
-    async def test_an_answer_that_is_not_boats_envelope_is_transient(
-        self, fake_boat: FakeBoat, answer: Callable[[], httpx.Response]
-    ) -> None:
-        existing = fake_boat.sandbox()
-        backend = BoatSandboxBackend(ref=WorkspaceRef(provider='boat', id=existing.id))
-        fake_boat.errors['get'] = [answer()]
-        with pytest.raises(BoatAPIError, match=r'^Boat API returned HTTP \d+ \(invalid_response\): Unexpected Boat'):
-            await backend.working_dir()
-        assert await backend.working_dir() == str(existing.home)
-
-    async def test_an_attach_that_never_answers_is_transient(
+    async def test_an_attach_that_never_becomes_ready_is_transient(
         self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        existing = fake_boat.sandbox()
-        monkeypatch.setattr(f'{_BACKEND}._CREATE_TIMEOUT', 0.05)
-        fake_boat.gates['get'] = asyncio.Event()
+        monkeypatch.setattr(f'{_BACKEND}._CREATE_TIMEOUT', 0.0)
+        existing = fake_boat.sandbox('provisioning')
+        existing.next_states = ['cloning', 'cloning']
         with pytest.raises(TimeoutError) as exc_info:
             await BoatSandboxBackend(ref=WorkspaceRef(provider='boat', id=existing.id)).working_dir()
-        assert str(exc_info.value) == f'Connecting to Boat sandbox {existing.id!r} did not complete within 0.05s.'
+        assert type(exc_info.value) is TimeoutError
 
 
 class TestAutoStop:
@@ -729,33 +677,42 @@ class TestAutoStop:
         self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         advance = advance_clock(monkeypatch)
+        monkeypatch.setattr(f'{_BACKEND}._KEEP_ALIVE_INTERVAL', 0.01)
         backend = await started(BoatSandboxBackend(auto_stop=0))
         advance(30 * 24 * 3600)
         assert await backend.exists(f'{only(fake_boat).home}/note') is False
-        assert 'update' not in routes(fake_boat)
+        assert (await backend.run(['sleep', '0.1'])).exit_code == 0
+        assert 'update' not in fake_boat.routes()
 
-    async def test_a_long_command_extends_the_auto_stop_between_checks(
+    async def test_a_running_command_extends_the_auto_stop(
         self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Boat does not count a running command as activity; the same rule at a small interval.
+        backend = await started(BoatSandboxBackend(auto_stop=900))
+        monkeypatch.setattr(f'{_BACKEND}._KEEP_ALIVE_INTERVAL', 0.02)
+        assert (await backend.run(['sleep', '0.3'])).exit_code == 0
+        routes = fake_boat.routes()
+        assert routes[routes.index('follow') :].count('update') >= 2
+
+    async def test_a_command_outlives_an_extension_that_finds_the_sandbox_gone(
+        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The command's own stream reports a deleted or stopped sandbox; extending stops at the first sign.
         advance = advance_clock(monkeypatch)
         backend = await started(BoatSandboxBackend(auto_stop=900))
-        fake_boat.errors['status'] = [status(running=True), status(running=False, exit_code=0)]
-        sleep = anyio.sleep
-
-        async def pass_time(delay: float) -> None:
-            advance(450)
-            await sleep(0)
-
-        monkeypatch.setattr(anyio, 'sleep', pass_time)
-        assert (await backend.run(['true'])).exit_code == 0
-        assert routes(fake_boat)[-4:] == ['start', 'status', 'update', 'status']
+        monkeypatch.setattr(f'{_BACKEND}._KEEP_ALIVE_INTERVAL', 0.02)
+        advance(3600)
+        fake_boat.errors['update'] = [None, boat_error(404, 'not_found', 'not_found')]
+        assert (await backend.run(['sleep', '0.3'])).exit_code == 0
+        assert fake_boat.routes().count('update') == 2
 
     async def test_a_failed_extension_does_not_fail_the_operation(
         self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         advance = advance_clock(monkeypatch)
         existing = fake_boat.sandbox()
-        fake_boat.errors['update'] = [httpx.ConnectError('offline'), httpx.ConnectError('offline')]
+        offline = urllib3.exceptions.ProtocolError('offline')
+        fake_boat.errors['update'] = [offline, offline]
         backend = BoatSandboxBackend(ref=WorkspaceRef(provider='boat', id=existing.id))
         path = f'{existing.home}/note'
         with caplog.at_level(logging.DEBUG, logger=_BACKEND):
@@ -764,10 +721,13 @@ class TestAutoStop:
             for elapsed in (0, 0, 60, 60):
                 advance(elapsed)
                 assert await backend.exists(path) is False
-        assert routes(fake_boat).count('update') == 3
+        assert fake_boat.routes().count('update') == 3
         assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
-            (logging.WARNING, f"Could not extend the auto-stop of Boat sandbox {existing.id}: ConnectError('offline')"),
-            (logging.DEBUG, f"Could not extend the auto-stop of Boat sandbox {existing.id}: ConnectError('offline')"),
+            (
+                logging.WARNING,
+                f"Could not extend the auto-stop of Boat sandbox {existing.id}: ProtocolError('offline')",
+            ),
+            (logging.DEBUG, f"Could not extend the auto-stop of Boat sandbox {existing.id}: ProtocolError('offline')"),
         ]
 
     async def test_an_extension_boat_refuses_for_the_key_is_not_asked_again(
@@ -781,12 +741,12 @@ class TestAutoStop:
             for _ in range(3):
                 assert await backend.exists(f'{existing.home}/note') is False
                 advance(3600)
-        assert routes(fake_boat).count('update') == 1
+        assert fake_boat.routes().count('update') == 1
         assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
             (
                 logging.WARNING,
-                f'Could not extend the auto-stop of Boat sandbox {existing.id}: BoatAPIError('
-                "'Boat API returned HTTP 403 (api_key_action_forbidden): The action is not on the key.')",
+                f'Could not extend the auto-stop of Boat sandbox {existing.id}: Boat answered HTTP 403 '
+                '(api_key_action_forbidden): The action is not on the key.',
             ),
         ]
 
@@ -808,52 +768,7 @@ class TestAutoStop:
         with pytest.raises(WorkspaceUnavailableError) as exc_info:
             await backend.run(['true'])
         assert str(exc_info.value) == expected
-        assert routes(fake_boat)[-1] == 'update'
-
-
-class TestRetries:
-    @pytest.mark.parametrize(
-        ('route', 'answer'),
-        [
-            pytest.param('run', (409, 'sandbox_starting', 'Sandbox is starting.'), id='starting'),
-            pytest.param('run', (502, 'sandbox_direct_failed', 'sandbox_restoring'), id='restoring'),
-            pytest.param('read', (502, 'sandbox_direct_failed', 'Machine did not answer.'), id='retryable-read'),
-        ],
-    )
-    async def test_answers_boat_documents_as_not_taking_effect_are_repeated(
-        self, fake_boat: FakeBoat, route: str, answer: tuple[int, str, str]
-    ) -> None:
-        backend = await started(BoatSandboxBackend())
-        path = f'{only(fake_boat).home}/note'
-        await backend.write_bytes(path, b'kept')
-        before = routes(fake_boat).count(route)
-        fake_boat.errors[route] = [boat_error(*answer, retryable=True)]
-        if route == 'run':
-            assert await backend.exists(path) is True
-        else:
-            assert await backend.read_bytes(path) == b'kept'
-        assert routes(fake_boat).count(route) == before + 2
-
-    async def test_a_command_that_may_have_run_is_not_repeated(self, fake_boat: FakeBoat) -> None:
-        # Retryable, but neither "starting" nor "restoring": the command may have run, so it is not sent again.
-        backend = await started(BoatSandboxBackend())
-        fake_boat.errors['run'] = [boat_error(502, 'sandbox_direct_failed', 'Machine did not answer.', retryable=True)]
-        with pytest.raises(BoatAPIError) as exc_info:
-            await backend.exists(f'{only(fake_boat).home}/note')
-        assert (exc_info.value.status, exc_info.value.retryable) == (502, True)
-        assert routes(fake_boat).count('run') == 2
-
-    async def test_a_sandbox_still_starting_after_the_retry_window_is_a_workspace_error(
-        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr('pydantic_ai_harness.boat_sandbox._api._RETRY_WINDOW', 0)
-        fake_boat.errors['run'] = [boat_error(409, 'sandbox_starting', 'Sandbox is starting.')]
-        with pytest.raises(WorkspaceError) as exc_info:
-            await BoatSandboxBackend().working_dir()
-        assert str(exc_info.value) == (
-            'Could not run a command in the sandbox: Boat API returned HTTP 409 (sandbox_starting): Sandbox is starting.'
-        )
-        assert routes(fake_boat).count('run') == 1
+        assert fake_boat.routes()[-1] == 'update'
 
 
 class TestCommands:
@@ -880,7 +795,7 @@ class TestCommands:
         }
         with pytest.raises(error):
             await calls[case]()
-        assert fake_boat.opened_clients == 0
+        assert fake_boat.calls == []
 
     async def test_commands_start_detached_with_their_env_inside_the_wrapper(self, fake_boat: FakeBoat) -> None:
         # `env` runs inside the wrapper's `sh`; outside it, a dash `sh` would drop `A.B` before the command ran.
@@ -889,16 +804,19 @@ class TestCommands:
         assert result == CommandResult(exit_code=0, stdout='1 3', stderr='')
         result = await backend.run('printf hello | tr a-z A-Z', shell=True)
         assert result.stdout == 'HELLO'
-        assert [{**body, 'command': unmarked(body['command'])} for body in fake_boat.bodies('start')] == [
+        # Boat ignores the SDK's default `timeoutSeconds` on a detached command.
+        assert fake_boat.bodies('start') == [
             {
-                'command': 'exec sh -c \': MARK; "$@" </dev/null; exit $?\' sh env -- A=1 B=3 A.B=x '
-                'sh -c \'printf "%s %s" "$A" "$B"\'',
+                'command': f'{_WRAPPER} env -- A=1 B=3 A.B=x sh -c \'printf "%s %s" "$A" "$B"\'',
+                'timeoutSeconds': 30,
                 'detached': True,
+                'stream': False,
             },
             {
-                'command': 'exec sh -c \': MARK; "$@" </dev/null; exit $?\' sh env -- A=1 B=2 '
-                "/bin/sh -c 'printf hello | tr a-z A-Z'",
+                'command': f"{_WRAPPER} env -- A=1 B=2 /bin/sh -c 'printf hello | tr a-z A-Z'",
+                'timeoutSeconds': 30,
                 'detached': True,
+                'stream': False,
             },
         ]
 
@@ -935,47 +853,50 @@ class TestCommands:
             await attached.working_dir()
         assert str(exc_info.value) == message
         # The command had exited, so nothing was stopped; and a command's own exit 125 is its result.
-        assert 'kill' not in routes(fake_boat)
+        assert 'stop' not in fake_boat.routes()
         assert await owner.run(['sh', '-c', 'echo out; exit 125']) == CommandResult(
             exit_code=125, stdout='out\n', stderr=''
         )
 
-    async def test_output_over_the_limit_raises_with_a_preview(
+    async def test_output_over_the_limit_stops_the_command_and_raises_with_a_preview(
         self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Boat keeps the last 8 MiB of each stream; the same rule at a small size.
+        # The same rule as the 8 MiB limit, at a small size.
         monkeypatch.setattr(f'{_BACKEND}._MAX_OUTPUT_BYTES', 8192)
         monkeypatch.setattr(f'{_BACKEND}._OUTPUT_PREVIEW_BYTES', 64)
         backend = await started(BoatSandboxBackend())
-        script = (
-            'printf b; head -c 10000 /dev/zero | tr "\\0" a; '
-            'printf x >&2; for i in $(seq 40); do printf "\\303\\251" >&2; done'
-        )
+        fake_boat.errors['follow'] = [
+            Frames(
+                [
+                    {'type': 'stderr', 'data': 'x' + 'é' * 40},
+                    {'type': 'stdout', 'data': 'b'},
+                    {'type': 'stdout', 'data': 'a' * 10000},
+                    {'type': 'stdout', 'data': 'never read'},
+                ]
+            )
+        ]
         with pytest.raises(WorkspaceOutputLimitError) as exc_info:
-            await backend.run(['sh', '-c', script])
+            await backend.run(['sleep', '30'])
         error = exc_info.value
-        # The preview is the beginning of each stream, read from offset 0, not the tail Boat kept. It
-        # is cut at 64 bytes, not characters, and the two-byte character split at the cut is dropped.
-        assert (error.limit, error.stdout, error.stderr) == (8192, 'b' + 'a' * 63, 'x' + '\u00e9' * 31)
-        assert [dict(call.request.url.params) for call in fake_boat.calls if call.route == 'status'][-2:] == [
-            {'tailBytes': '8192'},
-            {'stdoutOffset': '0', 'stderrOffset': '0'},
-        ]
-        assert 'kill' not in routes(fake_boat)
+        # The preview is the beginning of each stream. It is cut at 64 bytes, not characters, and the
+        # two-byte character split at the cut is dropped.
+        assert (error.limit, error.stdout, error.stderr) == (8192, 'b' + 'a' * 63, 'x' + 'é' * 31)
+        # Reading stops at the limit, and the command is stopped rather than left writing.
+        assert only_command(fake_boat).stopped
 
-    async def test_the_timeout_carries_partial_output_and_stops_the_command(self, fake_boat: FakeBoat) -> None:
+    async def test_the_timeout_carries_partial_output_and_stops_the_command(
+        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The end of each stream, as at most 4 KiB of it; the same rule at a small size.
+        monkeypatch.setattr(f'{_BACKEND}._PARTIAL_OUTPUT_LIMIT', 8)
         backend = await started(BoatSandboxBackend())
-        fake_boat.errors['status'] = [
-            status(running=True, stdout='partial out', stderr='partial err') for _ in range(100)
-        ]
+        command = 'echo first; echo partial out; echo partial err >&2; exec sleep 30'
         with anyio.fail_after(10), pytest.raises(WorkspaceTimeoutError) as exc_info:
-            await backend.run(['sleep', '30'], timeout=0.05)
-        assert (exc_info.value.stdout, exc_info.value.stderr) == ('partial out', 'partial err')
-        assert str(exc_info.value) == 'Command timed out after 0.05 seconds'
-        # Each check reads only the tail a timeout reports.
-        assert {call.request.url.params['tailBytes'] for call in fake_boat.calls if call.route == 'status'} == {'4096'}
-        command = only_command(fake_boat)
-        assert command.stopped and command.process.poll() is not None
+            await backend.run(['sh', '-c', command], timeout=0.5)
+        assert (exc_info.value.stdout, exc_info.value.stderr) == ('ial out\n', 'ial err\n')
+        assert str(exc_info.value) == 'Command timed out after 0.5 seconds'
+        command_ = only_command(fake_boat)
+        assert command_.stopped and command_.process.poll() is not None
 
     @pytest.mark.parametrize('answered', [pytest.param(True, id='answered'), pytest.param(False, id='cut-off')])
     async def test_a_stop_waits_for_boats_answer_until_the_kill_timeout(
@@ -985,10 +906,10 @@ class TestCommands:
         # than the 2 seconds a stop gets by default. The same rule at a small size.
         monkeypatch.setattr(f'{_BACKEND}._KILL_TIMEOUT', 0.5 if answered else 0.05)
         backend = await started(BoatSandboxBackend())
-        release = fake_boat.gates['kill'] = asyncio.Event()
+        release = fake_boat.gates['stop'] = threading.Event()
 
         async def answer_late() -> None:
-            await fake_boat.reached['kill'].wait()
+            await until(fake_boat.reached['stop'].is_set)
             await anyio.sleep(0.1)
             if answered:
                 release.set()
@@ -1002,57 +923,46 @@ class TestCommands:
         assert only_command(fake_boat).stopped is answered
         assert ('it may still be running' in caplog.text) is not answered
 
-    async def test_checks_of_a_running_command_back_off(
-        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Boat allows 1,000 API requests a minute from one IP address; checks every 0.2 seconds would
-        # use a fifth of that for each running command.
-        monkeypatch.setattr(f'{_BACKEND}._POLL_INTERVAL', 0.2)
-        monkeypatch.setattr(f'{_BACKEND}._MAX_POLL_INTERVAL', 2.0)
-        backend = await started(BoatSandboxBackend())
-        fake_boat.errors['status'] = [*(status(running=True) for _ in range(6)), status(running=False, exit_code=0)]
-        delays = record_sleeps(monkeypatch)
-        assert (await backend.run(['true'])).exit_code == 0
-        assert delays == [0.2, 0.4, 0.8, 1.6, 2.0, 2.0]
-
-    async def test_a_check_refused_by_boats_request_limit_waits_as_told(
-        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        backend = await started(BoatSandboxBackend())
-        fake_boat.errors['status'] = [ip_limited(retry_after=3)]
-        delays = record_sleeps(monkeypatch)
-        assert await backend.run(['echo', 'done']) == CommandResult(exit_code=0, stdout='done\n', stderr='')
-        # Boat sends no `Retry-After` header; the wait is in the body.
-        assert delays[0] == 3
-        assert routes(fake_boat).count('status') >= 2
-        assert 'kill' not in routes(fake_boat)
-
     @pytest.mark.parametrize(
         ('answer', 'logged'),
         [
             pytest.param((500, 'internal_error', 'Internal error.'), True, id='failed'),
-            # Boat no longer knows the command, or its sandbox is gone: nothing is left running.
+            # Boat no longer knows the command: nothing is left running.
             pytest.param(
                 (400, 'sandbox_direct_failed', 'Process 1 was not started by a detached command.'), False, id='gone'
             ),
-            pytest.param((404, 'not_found', 'not_found'), False, id='sandbox-gone'),
         ],
     )
     async def test_a_failed_stop_is_logged_and_the_timeout_still_raises(
-        self,
-        fake_boat: FakeBoat,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-        answer: tuple[int, str, str],
-        logged: bool,
+        self, fake_boat: FakeBoat, caplog: pytest.LogCaptureFixture, answer: tuple[int, str, str], logged: bool
     ) -> None:
-        without_repeats(monkeypatch)
         backend = await started(BoatSandboxBackend())
-        fake_boat.errors['kill'] = [boat_error(*answer)]
+        fake_boat.errors['stop'] = [boat_error(*answer)]
         with anyio.fail_after(10), pytest.raises(WorkspaceTimeoutError):
             await backend.run(['sleep', '30'], timeout=0.05)
-        assert routes(fake_boat).count('kill') == 1
+        assert fake_boat.routes().count('stop') == 1
         assert ('it may still be running' in caplog.text) is logged
+
+    @pytest.mark.parametrize('change', ['deleted', 'stopped'])
+    async def test_a_timeout_whose_stop_finds_the_sandbox_gone_is_unavailable(
+        self, fake_boat: FakeBoat, caplog: pytest.LogCaptureFixture, change: str
+    ) -> None:
+        # A deleted sandbox's output stream can hang until the timeout, rather than report the deletion.
+        backend = await started(BoatSandboxBackend())
+        sandbox = only(fake_boat)
+        fake_boat.gates['follow'] = threading.Event()
+        task = asyncio.create_task(backend.run(['sleep', '30'], timeout=0.3))
+        with anyio.fail_after(10):
+            await until(fake_boat.reached['follow'].is_set)
+            if change == 'deleted':
+                await BoatSandbox().destroy(WorkspaceRef(provider='boat', id=sandbox.id))
+            else:
+                fake_boat.stop(sandbox.id)
+            with pytest.raises(WorkspaceUnavailableError) as exc_info:
+                await task
+        assert str(exc_info.value) == (unavailable if change == 'deleted' else stopped)(sandbox.id)
+        assert isinstance(exc_info.value.__cause__, WorkspaceTimeoutError)
+        assert 'it may still be running' not in caplog.text
 
     async def test_a_command_boat_refuses_to_start_is_a_workspace_error(self, fake_boat: FakeBoat) -> None:
         backend = await started(BoatSandboxBackend())
@@ -1060,71 +970,80 @@ class TestCommands:
             await backend.run(['echo', 'x' * 140_000])
         assert type(exc_info.value) is WorkspaceError
         assert str(exc_info.value) == (
-            'Could not start the command: Boat API returned HTTP 400 (sandbox_direct_failed): '
+            'Could not start the command: Boat answered HTTP 400 (sandbox_direct_failed): '
             "E2BIG: argument list too long, posix_spawn 'systemd-run'"
         )
         # Nothing started, so nothing is looked up or stopped.
-        assert routes(fake_boat)[-1] == 'start'
+        assert fake_boat.routes()[-1] == 'start'
 
     @pytest.mark.parametrize(
-        ('failure', 'expected'),
+        'failure',
         [
             # Boat documents that a refused start did not run.
-            pytest.param(
-                lambda: boat_error(429, 'rate_limited', 'Too many commands.'), BoatAPIError, id='rate-limited'
-            ),
+            pytest.param(lambda: boat_error(429, 'rate_limited', 'Too many commands.'), id='rate-limited'),
             # The request never reached Boat.
-            pytest.param(lambda: httpx.ConnectError('connection refused'), httpx.ConnectError, id='not-sent'),
+            pytest.param(unreachable, id='not-sent'),
         ],
     )
     async def test_a_start_that_did_not_run_propagates_unchanged(
-        self,
-        fake_boat: FakeBoat,
-        caplog: pytest.LogCaptureFixture,
-        failure: Callable[[], httpx.Response | Exception],
-        expected: type[Exception],
+        self, fake_boat: FakeBoat, caplog: pytest.LogCaptureFixture, failure: Callable[[], Exception]
     ) -> None:
         # So a durable engine may retry it.
         backend = await started(BoatSandboxBackend())
-        fake_boat.errors['start'] = [failure()]
-        with pytest.raises(expected):
+        fake_boat.errors['start'] = [error := failure()]
+        with pytest.raises(type(error)) as exc_info:
             await backend.run(['true'])
-        # Nothing to look for or stop.
-        assert routes(fake_boat)[-2:] == ['start', 'get']
+        assert exc_info.value is error
+        # A lookup finds the sandbox running; there is nothing to stop.
+        assert fake_boat.routes()[-2:] == ['start', 'get']
         assert caplog.records == []
 
-    async def test_a_command_whose_start_was_not_confirmed_is_found_by_its_marker_and_stopped(
-        self, fake_boat: FakeBoat
+    @pytest.mark.parametrize(
+        ('failure', 'reason'),
+        [
+            # Boat started the command, but its answer was lost.
+            pytest.param(None, r'ReadTimeoutError\(.*: Read timed out\.\"\)', id='reply-lost'),
+            pytest.param(
+                lambda: boat_error(502, 'sandbox_direct_failed', 'Machine did not answer.', retryable=False),
+                re.escape('Boat answered HTTP 502 (sandbox_direct_failed): Machine did not answer.'),
+                id='server-error',
+            ),
+        ],
+    )
+    async def test_a_command_whose_start_was_not_confirmed_is_a_workspace_error(
+        self,
+        fake_boat: FakeBoat,
+        caplog: pytest.LogCaptureFixture,
+        failure: Callable[[], Exception] | None,
+        reason: str,
     ) -> None:
         backend = await started(BoatSandboxBackend())
-        fake_boat.lost_replies['start'] = 1
+        if failure is None:
+            fake_boat.lost_replies['start'] = 1
+        else:
+            fake_boat.errors['start'] = [failure()]
         with pytest.raises(WorkspaceError) as exc_info:
             await backend.run(['sleep', '30'])
         # Not transient: a retry could run the command a second time.
         assert type(exc_info.value) is WorkspaceError
-        assert str(exc_info.value) == 'Boat did not confirm that the command started, so it may be running: reply lost'
-        command = only_command(fake_boat)
-        assert command.stopped and command.process.poll() is not None
-        [kill] = [call.request for call in fake_boat.calls if call.route == 'kill']
-        assert kill.url.path.endswith(f'/commands/{command.process.pid}')
+        assert re.fullmatch(
+            rf'Boat did not confirm that the command started, so it may be running: {reason}', str(exc_info.value)
+        )
+        # Without its process ID there is no command to stop, which is logged.
+        assert 'stop' not in fake_boat.routes()
+        assert 'it may still be running' in caplog.text
 
-    async def test_an_unconfirmed_start_that_never_ran_stops_nothing(self, fake_boat: FakeBoat) -> None:
+    async def test_a_start_answered_without_detaching_is_a_workspace_error(self, fake_boat: FakeBoat) -> None:
         backend = await started(BoatSandboxBackend())
-        fake_boat.errors['start'] = [
-            boat_error(502, 'sandbox_direct_failed', 'Machine did not answer.', retryable=False)
-        ]
-        with pytest.raises(WorkspaceError, match=r'^Boat did not confirm that the command started'):
-            await backend.run(['sleep', '30'])
-        # The process list is searched for the command, which is not there.
-        assert routes(fake_boat)[-3:] == ['start', 'get', 'run']
-        assert only(fake_boat).commands == {}
+        fake_boat.errors['start'] = [finished(stdout='ran')]
+        with pytest.raises(WorkspaceError, match=r'^Boat ran the command without detaching it\.$'):
+            await backend.run(['true'])
+        assert 'stop' not in fake_boat.routes()
 
     async def test_a_command_boat_lost_track_of_is_unknown_and_stopped(self, fake_boat: FakeBoat) -> None:
         # Boat forgets a command's exit when the sandbox's agent restarts; the command may still run.
         backend = await started(BoatSandboxBackend())
-        fake_boat.errors['status'] = [
-            boat_ok('command.status', status='lost', known=False, running=False, exitCode=None, stdout='', stderr='')
-        ]
+        fake_boat.errors['follow'] = [Frames([{'type': 'exit', 'status': 'lost', 'exitCode': None}])]
         with pytest.raises(WorkspaceError) as exc_info:
             await backend.run(['sleep', '30'])
         assert type(exc_info.value) is WorkspaceError
@@ -1135,126 +1054,86 @@ class TestCommands:
         self, fake_boat: FakeBoat, caplog: pytest.LogCaptureFixture
     ) -> None:
         backend = await started(BoatSandboxBackend())
-        # Boat confirms the start, then knows nothing of the process: its checks and its stop say so.
-        fake_boat.errors['start'] = [boat_ok('command.started', processId=999_999)]
+        # Boat confirms the start, then knows nothing of the process: its output stream and its stop say so.
+        fake_boat.errors['start'] = [detached(999_999)]
         with pytest.raises(WorkspaceError, match=r'^Boat lost track of the command; its result is unknown\.$'):
             await backend.run(['true'])
-        assert routes(fake_boat)[-4:] == ['start', 'status', 'get', 'kill']
+        assert fake_boat.routes()[-4:] == ['start', 'follow', 'get', 'stop']
         assert caplog.records == []
 
     async def test_a_command_lost_with_its_sandbox_is_unavailable(self, fake_boat: FakeBoat) -> None:
         backend = await started(BoatSandboxBackend())
         sandbox_id = only(fake_boat).id
-        fake_boat.errors['status'] = [status(running=False, exit_code=None)]
+        fake_boat.errors['follow'] = [Frames([{'type': 'error', 'message': 'agent restarted'}])]
         fake_boat.errors['get'] = [boat_error(404, 'not_found', 'not_found')]
         with pytest.raises(WorkspaceUnavailableError) as exc_info:
             await backend.run(['true'])
         assert str(exc_info.value) == unavailable(sandbox_id)
 
     @pytest.mark.parametrize(
-        ('failure', 'delay'),
+        ('failure', 'message'),
         [
-            pytest.param(lambda: httpx.ConnectError('offline'), 0, id='transport'),
-            pytest.param(lambda: boat_error(500, 'internal_error', 'Internal error.'), 0, id='500'),
-            pytest.param(lambda: httpx.Response(502, text='<html>Bad Gateway</html>'), 0, id='502'),
             pytest.param(
-                lambda: httpx.Response(
-                    503, json={**boat_error(503, 'no_ready_machine', 'No machine.').json(), 'retryAfterSeconds': 5}
-                ),
-                5,
-                id='503',
+                lambda: urllib3.exceptions.ProtocolError('offline'),
+                "Could not read the result of a command that may still be running: ProtocolError('offline')",
+                id='network',
             ),
-            pytest.param(lambda: boat_error(504, 'gateway_timeout', 'Gateway timeout.'), 0, id='504'),
-        ],
-    )
-    async def test_a_failed_check_of_a_running_command_is_sent_again(
-        self,
-        fake_boat: FakeBoat,
-        monkeypatch: pytest.MonkeyPatch,
-        failure: Callable[[], httpx.Response | Exception],
-        delay: float,
-    ) -> None:
-        # A long command is checked many times; one failed check must not end it.
-        backend = await started(BoatSandboxBackend())
-        fake_boat.errors['status'] = [failure()]
-        delays = record_sleeps(monkeypatch)
-        assert await backend.run(['echo', 'done']) == CommandResult(exit_code=0, stdout='done\n', stderr='')
-        # A 503 says how long to wait in its body.
-        assert delays[0] == delay
-        assert 'kill' not in routes(fake_boat)
-
-    @pytest.mark.parametrize(
-        'failure',
-        [
-            pytest.param(lambda: httpx.ConnectError('offline'), id='transport'),
-            pytest.param(lambda: boat_error(500, 'internal_error', 'Internal error.'), id='server'),
+            pytest.param(
+                lambda: boat_error(500, 'internal_error', 'Internal error.'),
+                'Could not read the result of a command that may still be running: '
+                'Boat answered HTTP 500 (internal_error): Internal error.',
+                id='server',
+            ),
+            pytest.param(
+                lambda: Frames([{'type': 'stdout', 'data': 'partial'}]),
+                'Boat ended the output of the command without reporting its exit.',
+                id='cut-short',
+            ),
         ],
     )
     async def test_an_unreadable_result_is_a_workspace_error_and_the_command_is_stopped(
-        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch, failure: Callable[[], httpx.Response | Exception]
+        self, fake_boat: FakeBoat, failure: Callable[[], object], message: str
     ) -> None:
-        # Once the window for sending the check again has run out.
-        without_repeats(monkeypatch)
+        # The SDK reconnects a dropped stream for a minute before it gives up.
         backend = await started(BoatSandboxBackend())
-        fake_boat.errors['status'] = [failure()]
-        with pytest.raises(
-            WorkspaceError, match=r'^Could not read the result of a command that may still be running: '
-        ):
+        fake_boat.errors['follow'] = [failure()]
+        with pytest.raises(WorkspaceError) as exc_info:
             await backend.run(['sleep', '30'])
+        assert type(exc_info.value) is WorkspaceError
+        assert str(exc_info.value) == message
         assert only_command(fake_boat).stopped
 
-    async def test_aclose_waits_for_overlapping_runs(self, fake_boat: FakeBoat) -> None:
+    async def test_a_command_whose_caller_is_cancelled_during_its_start_is_stopped(self, fake_boat: FakeBoat) -> None:
+        # The start goes on in its thread and records the process ID, which the stop waits for.
         backend = await started(BoatSandboxBackend())
-        gate = fake_boat.gates['status'] = asyncio.Event()
-        runs = [asyncio.create_task(backend.run(['echo', str(index)])) for index in range(2)]
-        await until(lambda: routes(fake_boat).count('status') == 2)
-        closing = asyncio.create_task(backend.aclose())
-        await anyio.wait_all_tasks_blocked()
-        assert fake_boat.closed_clients == 0
-        gate.set()
-        with anyio.fail_after(10):
-            results = await asyncio.gather(*runs)
-            await closing
-        assert [result.stdout for result in results] == ['0\n', '1\n']
-        assert fake_boat.closed_clients == 1
-
-    async def test_a_cancelled_command_keeps_the_client_open_until_it_is_stopped(self, fake_boat: FakeBoat) -> None:
-        backend = await started(BoatSandboxBackend())
-        release = fake_boat.gates['kill'] = asyncio.Event()
+        release = fake_boat.gates['start'] = threading.Event()
         task = asyncio.create_task(backend.run(['sleep', '30']))
         with anyio.fail_after(10):
-            await fake_boat.reached['status'].wait()
+            await until(fake_boat.reached['start'].is_set)
             task.cancel()
-            await fake_boat.reached['kill'].wait()
-            closing = asyncio.create_task(backend.aclose())
-            await anyio.wait_all_tasks_blocked()
-            assert fake_boat.closed_clients == 0
+            await anyio.sleep(0.05)
             release.set()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            await closing
-        assert only_command(fake_boat).stopped
-        assert fake_boat.closed_clients == 1
+            await until(lambda: bool(only(fake_boat).commands) and only_command(fake_boat).stopped)
 
-    async def test_a_stop_a_repeated_cancellation_leaves_running_keeps_the_client_open(
+    async def test_a_stop_a_repeated_cancellation_leaves_running_still_stops_the_command(
         self, fake_boat: FakeBoat
     ) -> None:
         backend = await started(BoatSandboxBackend())
-        release = fake_boat.gates['kill'] = asyncio.Event()
+        release = fake_boat.gates['stop'] = threading.Event()
         task = asyncio.create_task(backend.run(['sleep', '30']))
         with anyio.fail_after(10):
-            await fake_boat.reached['status'].wait()
+            await until(fake_boat.reached['follow'].is_set)
             task.cancel()
-            await fake_boat.reached['kill'].wait()
+            await until(fake_boat.reached['stop'].is_set)
             # The second cancellation ends the run's wait for the stop, which keeps going.
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            await backend.aclose()
-            assert fake_boat.closed_clients == 0
+            assert not only_command(fake_boat).stopped
             release.set()
-            await until(lambda: fake_boat.closed_clients == 1)
-        assert only_command(fake_boat).stopped
+            await until(lambda: only_command(fake_boat).stopped)
 
 
 class TestErrorTranslation:
@@ -1276,14 +1155,14 @@ class TestErrorTranslation:
             pytest.param(
                 (409, 'conflict', 'Busy.'),
                 WorkspaceError,
-                'Could not access {path!r} in the sandbox: Boat API returned HTTP 409 (conflict): Busy.',
+                'Could not access {path!r} in the sandbox: Boat answered HTTP 409 (conflict): Busy.',
                 id='other-4xx',
             ),
             # A POSIX error Boat's message does not name is not a path failure the protocol knows.
             pytest.param(
                 (400, 'sandbox_direct_failed', 'EIO: i/o error, read'),
                 WorkspaceError,
-                'Could not access {path!r} in the sandbox: Boat API returned HTTP 400 (sandbox_direct_failed): '
+                'Could not access {path!r} in the sandbox: Boat answered HTTP 400 (sandbox_direct_failed): '
                 'EIO: i/o error, read',
                 id='unknown-errno',
             ),
@@ -1293,19 +1172,13 @@ class TestErrorTranslation:
                 "[Errno 20] Not a directory in the Boat sandbox: '{path}'",
                 id='errno',
             ),
-            pytest.param((429, 'rate_limited', 'Too many requests.'), BoatAPIError, None, id='rate-limited'),
-            pytest.param((503, 'no_ready_machine', 'No machine is ready.'), BoatAPIError, None, id='server'),
+            pytest.param((429, 'rate_limited', 'Too many requests.'), ApiException, None, id='rate-limited'),
+            pytest.param((503, 'no_ready_machine', 'No machine is ready.'), ServiceException, None, id='server'),
         ],
     )
     async def test_file_call_failures_are_translated(
-        self,
-        fake_boat: FakeBoat,
-        monkeypatch: pytest.MonkeyPatch,
-        answer: tuple[int, str, str],
-        expected: type[Exception],
-        message: str | None,
+        self, fake_boat: FakeBoat, answer: tuple[int, str, str], expected: type[Exception], message: str | None
     ) -> None:
-        without_repeats(monkeypatch)
         backend = await started(BoatSandboxBackend())
         path = f'{only(fake_boat).home}/note'
         fake_boat.errors['read'] = [boat_error(*answer)]
@@ -1313,10 +1186,9 @@ class TestErrorTranslation:
             await backend.read_bytes(path)
         assert type(exc_info.value) is expected
         if message is None:
-            # Transient: once the read is no longer sent again, it propagates unchanged if a lookup finds the
-            # sandbox still running.
-            assert isinstance(exc_info.value, BoatAPIError) and exc_info.value.status == answer[0]
-            assert routes(fake_boat)[-2:] == ['read', 'get']
+            # Transient: it propagates unchanged once a lookup finds the sandbox still running.
+            assert isinstance(exc_info.value, ApiException) and answered(exc_info.value)[0] == answer[0]
+            assert fake_boat.routes()[-2:] == ['read', 'get']
         else:
             assert str(exc_info.value) == message.format(path=path)
 
@@ -1333,20 +1205,15 @@ class TestErrorTranslation:
         ],
     )
     async def test_a_transient_failure_ends_the_run_when_the_sandbox_is_gone_or_stopped(
-        self,
-        fake_boat: FakeBoat,
-        monkeypatch: pytest.MonkeyPatch,
-        change: str,
-        expected: Callable[[str], str] | None,
+        self, fake_boat: FakeBoat, change: str, expected: Callable[[str], str] | None
     ) -> None:
-        without_repeats(monkeypatch)
         backend = await started(BoatSandboxBackend())
         sandbox = only(fake_boat)
         fake_boat.errors['read'] = [boat_error(503, 'no_ready_machine', 'No machine is ready.')]
         if change == 'deleted':
             await BoatSandbox().destroy(WorkspaceRef(provider='boat', id=sandbox.id))
         elif change == 'lookup-offline':
-            fake_boat.errors['get'] = [httpx.ConnectError('offline')]
+            fake_boat.errors['get'] = [urllib3.exceptions.ProtocolError('offline')]
         elif change == 'lookup-failed':
             fake_boat.errors['get'] = [boat_error(500, 'internal_error', 'Internal error.')]
         elif change != 'none':
@@ -1354,11 +1221,11 @@ class TestErrorTranslation:
         with pytest.raises(Exception) as exc_info:
             await backend.read_bytes(f'{sandbox.home}/note')
         if expected is None:
-            assert isinstance(exc_info.value, BoatAPIError) and exc_info.value.status == 503
+            assert isinstance(exc_info.value, ServiceException) and answered(exc_info.value)[0] == 503
         else:
             assert type(exc_info.value) is WorkspaceUnavailableError
             assert str(exc_info.value) == expected(sandbox.id)
-            assert isinstance(exc_info.value.__cause__, BoatAPIError)
+            assert isinstance(exc_info.value.__cause__, ServiceException)
 
     @pytest.mark.parametrize(
         ('state', 'operation'),
@@ -1385,6 +1252,17 @@ class TestErrorTranslation:
         assert await BoatSandboxBackend(ref=backend.ref).read_bytes(path) == b'kept'
         assert sandbox.resume_calls == 1
 
+    async def test_a_sandbox_stopped_while_a_command_runs_is_unavailable(self, fake_boat: FakeBoat) -> None:
+        backend = await started(BoatSandboxBackend())
+        sandbox = only(fake_boat)
+        task = asyncio.create_task(backend.run(['sleep', '30']))
+        with anyio.fail_after(10):
+            await until(fake_boat.reached['follow'].is_set)
+            fake_boat.stop(sandbox.id)
+            with pytest.raises(WorkspaceUnavailableError) as exc_info:
+                await task
+        assert str(exc_info.value) == stopped(sandbox.id)
+
     @pytest.mark.parametrize(
         ('answer', 'expected', 'message'),
         [
@@ -1402,6 +1280,18 @@ class TestErrorTranslation:
                 id='truncated',
             ),
             pytest.param(
+                lambda: finished(exit_code=None),
+                WorkspaceError,
+                'Boat did not report how an internal command exited in Boat sandbox {id}.',
+                id='no-exit-code',
+            ),
+            pytest.param(
+                lambda: detached(1),
+                WorkspaceError,
+                'Boat did not report how an internal command exited in Boat sandbox {id}.',
+                id='detached',
+            ),
+            pytest.param(
                 lambda: finished(exit_code=1, stderr='pwd: boom'),
                 WorkspaceError,
                 'Could not determine the working directory of Boat sandbox {id}: pwd: boom',
@@ -1416,17 +1306,19 @@ class TestErrorTranslation:
         ],
     )
     async def test_internal_command_failures_are_workspace_errors(
-        self, fake_boat: FakeBoat, answer: Callable[[], httpx.Response], expected: type[Exception], message: str
+        self,
+        fake_boat: FakeBoat,
+        answer: Callable[[], boat_sdk.Command200Response],
+        expected: type[Exception],
+        message: str,
     ) -> None:
-        backend = await started(BoatSandboxBackend())
-        sandbox_id = only(fake_boat).id
-        await backend.aclose()
-        # The next operation probes the working directory again, and gets this answer.
+        existing = fake_boat.sandbox()
+        # Probing the working directory is the first command, and gets this answer.
         fake_boat.errors['run'] = [answer()]
         with pytest.raises(expected) as exc_info:
-            await backend.working_dir()
+            await BoatSandboxBackend(ref=WorkspaceRef(provider='boat', id=existing.id)).working_dir()
         assert type(exc_info.value) is expected
-        assert str(exc_info.value) == message.format(id=sandbox_id)
+        assert str(exc_info.value) == message.format(id=existing.id)
 
 
 class TestDeletedSandbox:
@@ -1457,16 +1349,17 @@ class TestDeletedSandbox:
             await calls[operation]()
         assert str(exc_info.value) == unavailable(sandbox.id)
 
-    async def test_the_working_dir_is_cached_and_reverified_after_aclose(self, fake_boat: FakeBoat) -> None:
+    async def test_the_working_dir_is_resolved_once_and_an_attach_finds_the_sandbox_gone(
+        self, fake_boat: FakeBoat
+    ) -> None:
         backend = BoatSandboxBackend()
         first = await backend.working_dir()
         assert await backend.working_dir() == first
-        assert routes(fake_boat).count('run') == 1
-        await backend.aclose()
+        assert fake_boat.routes().count('run') == 1
         assert backend.ref is not None
         await BoatSandbox().destroy(backend.ref)
         with pytest.raises(WorkspaceUnavailableError, match='was not found'):
-            await backend.working_dir()
+            await BoatSandboxBackend(ref=backend.ref).working_dir()
 
 
 class TestFiles:
@@ -1489,18 +1382,31 @@ class TestFiles:
         assert (outside / 'nested' / 'data.bin').read_bytes() == data
         assert await backend.read_bytes(path) == data
         # Boat's file API was asked first, and refused.
-        assert (routes(fake_boat).count('write'), routes(fake_boat).count('read')) == (1, 1)
+        assert (fake_boat.routes().count('write'), fake_boat.routes().count('read')) == (1, 1)
+
+    async def test_a_large_file_goes_through_a_signed_download(
+        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = await started(BoatSandboxBackend())
+        path = only(fake_boat).home / 'big.bin'
+        path.write_bytes(data := os.urandom(5 * 1024 * 1024 + 1))
+        assert await backend.read_bytes(str(path)) == data
+        assert [route for route in fake_boat.routes() if route in ('read', 'download_url', 'transfer')] == [
+            'read',
+            'download_url',
+            'transfer',
+        ]
 
     @pytest.mark.parametrize(
         ('answer', 'expected'),
         [
             # Boat signs the URL without checking the path, so the machine answers for a file gone meanwhile.
             pytest.param(None, FileNotFoundError, id='gone'),
-            pytest.param(lambda: httpx.Response(502, text='Bad Gateway'), BoatAPIError, id='not-json'),
+            pytest.param(lambda: Answer(502, b'Bad Gateway'), ApiException, id='not-json'),
         ],
     )
     async def test_a_failed_download_of_a_large_file(
-        self, fake_boat: FakeBoat, answer: Callable[[], httpx.Response] | None, expected: type[Exception]
+        self, fake_boat: FakeBoat, answer: Callable[[], Answer] | None, expected: type[Exception]
     ) -> None:
         backend = await started(BoatSandboxBackend())
         path = f'{only(fake_boat).home}/big.bin'
@@ -1514,9 +1420,9 @@ class TestFiles:
         if isinstance(exc_info.value, FileNotFoundError):
             assert (exc_info.value.errno, exc_info.value.filename) == (errno.ENOENT, path)
         else:
-            assert isinstance(exc_info.value, BoatAPIError)
-            assert (exc_info.value.status, exc_info.value.code) == (502, 'invalid_response')
-        assert [route for route in routes(fake_boat) if route in ('download_url', 'transfer')] == [
+            assert isinstance(exc_info.value, ApiException)
+            assert answered(exc_info.value) == (502, 'Bad Gateway')
+        assert [route for route in fake_boat.routes() if route in ('download_url', 'transfer')] == [
             'download_url',
             'transfer',
         ]
@@ -1528,16 +1434,16 @@ class TestFiles:
         fake_boat.errors['read'] = [
             boat_error(400, 'sandbox_direct_failed', 'File is too large for read_file (6000000 bytes > 5242880).')
         ]
-        release = fake_boat.gates['transfer'] = asyncio.Event()
+        release = fake_boat.gates['transfer'] = threading.Event()
         read = asyncio.create_task(backend.read_bytes(f'{sandbox.home}/big.bin'))
         with anyio.fail_after(10):
-            await fake_boat.reached['transfer'].wait()
+            await until(fake_boat.reached['transfer'].is_set)
             sandbox.state = 'archived'
             release.set()
             with pytest.raises(WorkspaceUnavailableError) as exc_info:
                 await read
         assert str(exc_info.value) == stopped(sandbox.id)
-        assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+        assert isinstance(exc_info.value.__cause__, urllib3.exceptions.ProtocolError)
 
     @pytest.mark.parametrize(
         'target',
@@ -1577,8 +1483,8 @@ class TestFiles:
             await backend.write_bytes(str(path), data)
             assert path.read_bytes() == data
             # Never inline, and the API key never reaches the machine the URL points at (the fake checks it).
-            assert 'write' not in routes(fake_boat)
-            assert ('transfer' in routes(fake_boat)) is (target == 'inside')
+            assert 'write' not in fake_boat.routes()
+            assert ('transfer' in fake_boat.routes()) is (target == 'inside')
         else:
             expected = {
                 'below-a-file': NotADirectoryError,
@@ -1588,26 +1494,25 @@ class TestFiles:
             with pytest.raises(expected):
                 await backend.write_bytes(str(path), data)
 
-    @pytest.mark.parametrize('target', ['fifo', 'regular-file'])
-    async def test_a_write_that_times_out_is_refused_on_a_fifo(
-        self, fake_boat: FakeBoat, monkeypatch: pytest.MonkeyPatch, target: str
-    ) -> None:
-        # Boat answers a write to a FIFO only once something reads it, so the request times out; the
-        # path is checked once the write is no longer sent again, rather than before every write.
-        without_repeats(monkeypatch)
+    @pytest.mark.parametrize('target', ['fifo', 'regular-file', 'unreachable'])
+    async def test_a_write_that_times_out_is_refused_on_a_fifo(self, fake_boat: FakeBoat, target: str) -> None:
+        # Boat answers a write to a FIFO only once something reads it, so the SDK's request times out,
+        # and so do its repeats; the path is checked then, rather than before every write.
         backend = await started(BoatSandboxBackend())
         path = only(fake_boat).home / target
         if target == 'fifo':
             os.mkfifo(path)
         else:
             path.write_bytes(b'')
-            fake_boat.errors['write'] = [httpx.ReadTimeout('timed out')]
-        with pytest.raises(OSError if target == 'fifo' else httpx.ReadTimeout) as exc_info:
+            fake_boat.errors['write'] = [gave_up_reading() if target == 'regular-file' else unreachable()]
+        with pytest.raises(OSError if target == 'fifo' else urllib3.exceptions.MaxRetryError) as exc_info:
             await backend.write_bytes(str(path), b'data')
         if target == 'fifo':
             assert type(exc_info.value) is OSError
             assert str(exc_info.value) == f'Not a regular file in the Boat sandbox: {str(path)!r}'
-            assert isinstance(exc_info.value.__cause__, httpx.ReadTimeout)
+            assert isinstance(exc_info.value.__cause__, urllib3.exceptions.MaxRetryError)
+        # Only a write that timed out is checked.
+        assert ('run' in fake_boat.routes()[-2:]) is (target != 'unreachable')
 
     async def test_a_write_through_a_dangling_symlink_creates_its_target(self, fake_boat: FakeBoat) -> None:
         # Boat's file API refuses a dangling link as if it led outside its roots; the shell writes through it.
@@ -1647,90 +1552,4 @@ class TestFiles:
         }
         with pytest.raises(ValueError, match=r'^Boat file paths cannot contain a newline or carriage return$'):
             await calls[operation]()
-        assert fake_boat.opened_clients == 0
-
-
-class TestClients:
-    async def test_a_supplied_client_is_used_and_never_closed(self, fake_boat: FakeBoat) -> None:
-        client = fake_boat.supplied_client()
-        backend = BoatSandboxBackend(client=client)
-        assert (await backend.run(['echo', 'mine'])).stdout == 'mine\n'
-        await backend.aclose()
-        assert not client.is_closed
-        assert (await backend.run(['true'])).exit_code == 0
-        assert (fake_boat.opened_clients, fake_boat.closed_clients) == (0, 0)
-
-    async def test_aclose_closes_the_owned_client_and_later_use_reattaches(self, fake_boat: FakeBoat) -> None:
-        backend = await started(BoatSandboxBackend())
-        path = f'{only(fake_boat).home}/note'
-        await backend.write_bytes(path, b'kept')
-        await backend.aclose()
-        assert (fake_boat.opened_clients, fake_boat.closed_clients) == (1, 1)
-        assert await backend.read_bytes(path) == b'kept'
-        assert fake_boat.opened_clients == 2
-        assert len(fake_boat.create_bodies) == 1
-
-    async def test_aclose_waits_for_an_in_flight_file_operation(self, fake_boat: FakeBoat) -> None:
-        backend = await started(BoatSandboxBackend())
-        path = f'{only(fake_boat).home}/note'
-        await backend.write_bytes(path, b'kept')
-        release = fake_boat.gates['read'] = asyncio.Event()
-        read = asyncio.create_task(backend.read_bytes(path))
-        with anyio.fail_after(10):
-            await fake_boat.reached['read'].wait()
-            close = asyncio.create_task(backend.aclose())
-            await anyio.wait_all_tasks_blocked()
-            assert fake_boat.closed_clients == 0
-            release.set()
-            assert await read == b'kept'
-            await close
-        assert fake_boat.closed_clients == 1
-
-    async def test_concurrent_acloses_close_the_client_once(
-        self, fake_boat: FakeBoat, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        backend = await started(BoatSandboxBackend())
-        await asyncio.gather(backend.aclose(), backend.aclose())
-        assert fake_boat.closed_clients == 1
-        assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
-
-    @pytest.mark.parametrize(
-        ('failure', 'logged'),
-        [
-            pytest.param('error', "Could not close the Boat API client: ConnectError('offline')", id='error'),
-            pytest.param('hang', 'Closing the Boat API client did not complete within 0.05s.', id='hang'),
-        ],
-    )
-    async def test_a_failed_close_is_logged(
-        self,
-        fake_boat: FakeBoat,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-        failure: str,
-        logged: str,
-    ) -> None:
-        monkeypatch.setattr(f'{_BACKEND}._TEARDOWN_TIMEOUT', 0.05)
-        backend = await started(BoatSandboxBackend())
-        if failure == 'error':
-            fake_boat.close_errors = iter([httpx.ConnectError('offline')])
-        else:
-            fake_boat.close_gate = asyncio.Event()
-        with anyio.fail_after(10):
-            await backend.aclose()
-        assert logged in caplog.messages
-        fake_boat.close_gate = None
-        # The next operation opens a client of its own and attaches by `ref`.
-        await backend.realpath('.')
-        assert fake_boat.opened_clients == 2
-
-    async def test_repeated_cancellation_finishes_owned_client_close(self, fake_boat: FakeBoat) -> None:
-        backend = await started(BoatSandboxBackend())
-        gate = fake_boat.close_gate = asyncio.Event()
-        task = asyncio.create_task(backend.aclose())
-        await anyio.wait_all_tasks_blocked()
-        task.cancel()
-        task.cancel()
-        gate.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert fake_boat.closed_clients == 1
+        assert fake_boat.calls == []

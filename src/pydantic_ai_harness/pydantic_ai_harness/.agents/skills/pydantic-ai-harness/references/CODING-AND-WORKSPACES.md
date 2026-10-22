@@ -227,7 +227,7 @@ Parameters: `denied_commands` (default `rm`, `rmdir`, `mkfs`, `dd`, `format`, `s
 
 | | `ModalSandbox` | `E2BSandbox` | `SpritesSandbox` | `DaytonaSandbox` | `BoatSandbox` |
 | --- | --- | --- | --- | --- | --- |
-| Extra | `[modal]` | `[e2b]` | `[sprites]` | `[daytona]` | None (uses `httpx`) |
+| Extra | `[modal]` | `[e2b]` | `[sprites]` | `[daytona]` | `[boat]` |
 | Credentials | `modal token new`, or `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` | `E2B_API_KEY` | `SPRITE_TOKEN` | `DAYTONA_API_KEY` | `BOAT_API_KEY` |
 | Lifetime | `sandbox_timeout=86_400` (10 to 86,400), optional `idle_timeout`; then terminated | `sandbox_timeout=3_600` (Pro: up to 86,400); then **paused**, resumed on attach | Unlimited: sleeps when idle, persists until deleted | Unlimited: stopped after `auto_stop_interval` idle minutes (default 15), started again on attach; archived after 7 days stopped, never deleted | Stopped at most `auto_stop` seconds after the last operation (default 1 hour; the backend extends Boat's deadline at most once a minute, or per half of a shorter auto-stop, while it works), resumed on attach; disk deleted 14 days after a stop |
 | Default cwd / user | `/root`, `root` | `/home/user`, `user` | `/home/sprite`, `sprite` | `/home/daytona`, `daytona` | `/home/user`, `user` (passwordless `sudo`) |
@@ -310,8 +310,8 @@ async def end_conversation(conv: Conversation) -> None:  # or on a TTL sweep
   (so do rejected credentials); no empty replacement is created unless you pass `workspace='new'`.
 - Default images lack project dependencies (even `pytest`). To prepare one up front, build
   `ModalSandboxBackend(working_dir=...)` (or E2B/Sprites/Daytona/Boat), use `Workspace(backend)` (`write_text`,
-  `run([...], timeout=300)`), pass `workspace=backend`, destroy `backend.ref` in `finally`; a Sprites,
-  Daytona or Boat backend you build needs `await backend.aclose()`.
+  `run([...], timeout=300)`), pass `workspace=backend`, destroy `backend.ref` in `finally`; a Sprites
+  or Daytona backend you build needs `await backend.aclose()` (a Boat one holds nothing to close).
 - Idempotent per-turn setup goes in a `@hooks.on.before_run` hook: `await ctx.workspace.run('test -d
   repo/.git || git clone <url> repo', shell=True, timeout=300)`. Clone into a subdirectory: `shell`,
   background commands, and output spills create `.pydantic-ai-harness/` in the working directory, so

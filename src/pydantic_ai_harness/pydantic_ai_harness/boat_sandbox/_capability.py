@@ -1,38 +1,26 @@
-"""Capability that supplies a Boat sandbox to an agent run."""
+"""Capability that supplies a Boat sandbox to an agent run.
+
+Unlike `DaytonaSandbox`, it has no per-run client lifecycle (no backend a run claims, and no client
+closed when the run ends or after each operation of a Temporal activity): Boat's SDK is synchronous
+and holds no event loop state, the backend calls it in worker threads, and one `boat_sdk.BoatApi`
+serves every run in the process, so a run leaves nothing to close.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from pydantic_ai.capabilities import AbstractCapability, WrapRunHandler
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai.workspaces import WorkspaceBackend, WorkspaceRef
-from pydantic_ai_harness._workspace import innermost_backend
 from pydantic_ai_harness._workspace_provider import check_env, check_integer, check_working_dir
 from pydantic_ai_harness.boat_sandbox._backend import BoatSandboxBackend, MachineType, destroy_sandbox
 
 if TYPE_CHECKING:
-    import httpx
-
-    from pydantic_ai.agent import AgentRunResult
-
-
-class _SuppliedBackend(BoatSandboxBackend):
-    """The backend `BoatSandbox` built for one run; the capability closes its client when that run ends."""
-
-    def __init__(self, *, run_id: str | None, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.run_id = run_id
-        # Until a run claims it, nothing closes this backend: Temporal builds one per activity and
-        # drops it, so its own client closes after each operation instead.
-        self._close_after_operation = True
-
-    def claim(self, owned: bool) -> None:
-        """Keep the client open across operations while the run that closes it is in progress."""
-        self._close_after_operation = not owned
+    from boat_sdk import BoatApi
 
 
 @dataclass(kw_only=True)
@@ -49,10 +37,11 @@ class BoatSandbox(AbstractCapability[AgentDepsT]):
     [Workspaces](https://pydantic.dev/docs/ai/core-concepts/workspace/) for more.
     """
 
-    client: httpx.AsyncClient | None = None
-    """An `httpx.AsyncClient` for Boat's API, with its `base_url` (`https://boat.dev/api/v1`) and an
-    `Authorization: Bearer` header set, to share across runs on one event loop; you close it. When
-    `None`, each run opens one from `BOAT_API_KEY` and closes it when the run ends."""
+    client: BoatApi | None = None
+    """A `boat_sdk.BoatApi` to create, attach to and delete sandboxes with, for example one whose
+    `boat_sdk.Configuration` routes through a proxy; you own it. When `None`, one is built from
+    `BOAT_API_KEY` on first use and shared by every run in the process with that key. The SDK holds
+    no event loop state, so one client serves runs on any event loop, and nothing needs closing."""
 
     machine_type: MachineType | None = None
     """Boat machine size for a newly created sandbox: `'small'`, `'default'`, `'large'` or
@@ -65,10 +54,10 @@ class BoatSandbox(AbstractCapability[AgentDepsT]):
 
     auto_stop: int | None = None
     """Seconds a newly created sandbox runs without the backend extending it before Boat stops it,
-    keeping its disk; `0` disables it, and `None` keeps Boat's default of an hour. Operations extend
-    it at most once a minute (once per half of it when it is under two minutes), so a run that works
-    in the sandbox more often than `auto_stop` minus that interval keeps it up, and an idle one
-    stops. Attaching resumes a stopped sandbox."""
+    keeping its disk; `0` disables it, and `None` keeps Boat's default of an hour. Operations, and
+    running commands, extend it at most once a minute (once per half of it when it is under two
+    minutes), so a run that works in the sandbox more often than `auto_stop` minus that interval
+    keeps it up, and an idle one stops. Attaching resumes a stopped sandbox."""
 
     working_dir: str | None = None
     """Absolute directory commands start in and relative paths resolve against; `None` uses the sandbox's own.
@@ -108,8 +97,7 @@ class BoatSandbox(AbstractCapability[AgentDepsT]):
         """Build the backend for this run. No I/O here: it attaches or creates on first use."""
         if ref is not None and ref.provider != 'boat':
             return None
-        return _SuppliedBackend(
-            run_id=ctx.run_id,
+        return BoatSandboxBackend(
             client=self.client,
             ref=ref,
             machine_type=self.machine_type,
@@ -118,18 +106,3 @@ class BoatSandbox(AbstractCapability[AgentDepsT]):
             working_dir=self.working_dir,
             env=self.env,
         )
-
-    async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
-        # Only the backend this run built: one passed in as `workspace=`, such as a parent run's
-        # handed to a subagent, belongs to the run that built it and may still be in use.
-        backend = innermost_backend(ctx.workspace)
-        owned = backend if isinstance(backend, _SuppliedBackend) and backend.run_id == ctx.run_id else None
-        if owned is not None:
-            owned.claim(True)
-        try:
-            return await handler()
-        finally:
-            if owned is not None:
-                # `result.workspace` outlives the run, with no one left to close it.
-                owned.claim(False)
-                await owned.aclose()

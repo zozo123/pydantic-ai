@@ -1,20 +1,26 @@
-"""A stateful fake of Boat's v1 REST API, served through `httpx.MockTransport`.
+"""A stateful fake of Boat's Python SDK (`boat-sdk`), at the boundary the backend calls.
 
-Answers carry Boat's real envelopes, status codes, error codes and messages (observed live on
-2026-10-21), so the backend's translation runs against what production returns. Each sandbox is a
-pair of host directories, its home and its `/tmp`: commands are real `bash -c` processes in their
-own session, so stopping one kills its process group, and file calls act on the host filesystem,
-limited to those two directories like Boat's file API.
+`FakeBoat.client` stands in for `boat_sdk.BoatApi`, and `FakeBoat.follow_command` for
+`boat_sdk.boat_helpers.follow_command`, the SDK helper that streams a detached command's output over
+HTTP; the other helpers the backend calls run for real against the fake client. Answers are the
+SDK's own models, and refusals its own exceptions carrying Boat's real codes and messages (observed
+live on 2026-10-21), so the backend's translation runs against what production returns. The backend
+calls the SDK in worker threads, so the fake is called in them too.
+
+Each sandbox is a pair of host directories, its home and its `/tmp`: commands are real `bash -c`
+processes in their own session, so stopping one kills its process group, and file calls act on the
+host filesystem, limited to those two directories like Boat's file API.
 
 Knobs, all keyed by route name (`create`, `get`, `update`, `resume`, `delete`, `run`, `start`,
-`status`, `kill`, `read`, `write`, `upload_url`, `download_url`, `transfer`):
+`follow`, `stop`, `read`, `write`, `upload_url`, `download_url`, `transfer`):
 
-- `errors[route]`: answers or exceptions served, in order, instead of handling the request; a `None`
-  entry lets that request through.
-- `lost_replies[route]`: how many requests are handled and then answered with `httpx.ReadTimeout`.
-- `gates[route]`: an event a request waits for before it is handled; `reached[route]` is set first.
+- `errors[route]`: exceptions raised, in order, instead of handling the call; a `None` entry lets that
+  call through. `run` and `start` also take an SDK answer to return, `transfer` an `Answer`, and `follow`
+  a `Frames` to serve.
+- `lost_replies[route]`: how many calls are handled and then fail as a reply lost to a read timeout.
+- `gates[route]`: a `threading.Event` a call waits for before it is handled; `reached[route]` is set first.
 
-`calls` records every request that reached a route, with its parsed JSON body.
+`calls` records every call that reached a route, with its arguments.
 
 Boat's refusals of a malformed request are kept as tripwires, marked uncovered: a correct backend
 never sends one, and the refusal fails the test that made it.
@@ -22,36 +28,45 @@ never sends one, and the refusal fails the test that made it.
 
 from __future__ import annotations
 
-import asyncio
 import base64
+import codecs
 import errno
+import json
 import os
-import re
 import signal
 import stat
 import subprocess
+import threading
+import time
+import uuid
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Iterator
 from contextlib import suppress
-from dataclasses import dataclass
-from functools import partial
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-import anyio.to_thread
-import httpx
-from pydantic import TypeAdapter
+import boat_sdk
+import urllib3
+from boat_sdk.exceptions import (
+    ApiException,
+    BadRequestException,
+    ConflictException,
+    ForbiddenException,
+    NotFoundException,
+    ServiceException,
+    UnauthorizedException,
+)
 
-BOAT_API_URL = 'https://boat.dev/api/v1'
 MACHINE_HOST = 'box-node-fake.on.boat.dev'
 MACHINE_TYPES = ('small', 'default', 'large', 'xlarge')
 _ID_ALPHABET = '23456789abcdefghjkmnpqrstuvwxyz'
 _STREAM_LIMIT = 8 * 1024 * 1024
-_OFFSET_PAGE = 1024 * 1024
 _FILE_LIMIT = 5 * 1024 * 1024
 _COMMAND_LIMIT = 131071
 _ROOTS_MESSAGE = 'Path must resolve under /home/user or /tmp (work directory: /home/user).'
-_BODY = TypeAdapter(dict[str, object])
 _NODE_ERRORS = {
     errno.ENOENT: 'ENOENT: no such file or directory',
     errno.EACCES: 'EACCES: permission denied',
@@ -59,49 +74,106 @@ _NODE_ERRORS = {
     errno.EISDIR: 'EISDIR: illegal operation on a directory',
     errno.ELOOP: 'ELOOP: too many symbolic links encountered',
 }
+_EXCEPTIONS: dict[int, type[ApiException]] = {
+    400: BadRequestException,
+    401: UnauthorizedException,
+    403: ForbiddenException,
+    404: NotFoundException,
+    409: ConflictException,
+}
+# A pool for the network errors the fake raises; building one opens no connection.
+_POOL = urllib3.HTTPSConnectionPool('boat.dev')
 
 
-def boat_error(status: int, code: str, message: str, **details: object) -> httpx.Response:
-    """An error answer in Boat's envelope."""
-    return httpx.Response(
-        status,
-        json={
-            'ok': False,
-            'type': 'sandbox.error',
-            'status': status,
-            'code': code,
-            'message': message,
-            'error': {
-                'code': code,
-                'message': message,
-                'status': status,
-                'details': {'error': code, 'message': message, **details},
-            },
-            'requestId': 'req_00000000000000000000000000000000',
-        },
+def boat_error(status: int, code: str, message: str, **details: object) -> ApiException:
+    """A refusal in Boat's envelope, as the SDK raises it: its exception class for the status."""
+    body = {
+        'ok': False,
+        'type': 'sandbox.error',
+        'status': status,
+        'code': code,
+        'message': message,
+        'error': {'code': code, 'message': message, 'status': status, 'details': {'error': code, **details}},
+        'requestId': 'req_00000000000000000000000000000000',
+    }
+    kind = _EXCEPTIONS.get(status, ServiceException if status >= 500 else ApiException)
+    return kind(status=status, reason=HTTPStatus(status).phrase, body=json.dumps(body))
+
+
+def answered(error: BaseException) -> tuple[object, object]:
+    """The HTTP status and body of one of the SDK's errors, which it leaves untyped."""
+    fields = vars(error)
+    return fields.get('status'), fields.get('body')
+
+
+def lost_reply() -> urllib3.exceptions.ReadTimeoutError:
+    """What the SDK raises when Boat's reply to a request it does not send again is lost."""
+    return urllib3.exceptions.ReadTimeoutError(_POOL, '/api/v1', 'Read timed out.')
+
+
+def unreachable() -> urllib3.exceptions.MaxRetryError:
+    """What the SDK raises once it gives up connecting: the request never reached Boat."""
+    reason = urllib3.exceptions.ConnectTimeoutError(None, 'Connection to boat.dev timed out.')
+    return urllib3.exceptions.MaxRetryError(_POOL, '/api/v1', reason)
+
+
+def gave_up_reading() -> urllib3.exceptions.MaxRetryError:
+    """What the SDK raises once it gives up on a request it sends again, after every reply timed out."""
+    return urllib3.exceptions.MaxRetryError(_POOL, '/api/v1', lost_reply())
+
+
+def finished(
+    *, exit_code: int | None = 0, stdout: str = '', stderr: str = '', timed_out: bool = False, truncated: bool = False
+) -> boat_sdk.Command200Response:
+    """Boat's answer to a synchronous command."""
+    return boat_sdk.Command200Response(
+        actual_instance=boat_sdk.CommandResponse.model_validate(
+            {
+                'ok': True,
+                'type': 'command.finished',
+                'success': exit_code == 0,
+                'exitCode': exit_code,
+                'stdout': stdout,
+                'stderr': stderr,
+                'stdoutTruncated': truncated,
+                'stderrTruncated': False,
+                'timedOut': timed_out,
+            }
+        )
     )
 
 
-def boat_ok(kind: str, http_status: int = 200, /, **body: object) -> httpx.Response:
-    """A successful answer in Boat's envelope."""
-    return httpx.Response(http_status, json={'ok': True, 'type': kind, **body})
+def detached(pid: int, command: str = 'true') -> boat_sdk.Command200Response:
+    """Boat's answer to a detached command."""
+    return boat_sdk.Command200Response(
+        actual_instance=boat_sdk.CommandStartedResponse.model_validate(
+            {
+                'ok': True,
+                'type': 'command.started',
+                'success': True,
+                'processId': pid,
+                'pid': pid,
+                'command': command,
+                'cwd': '.',
+                'startedAt': datetime.now(UTC).isoformat(),
+            }
+        )
+    )
 
 
-def _direct_failed(message: str) -> httpx.Response:
-    return boat_error(400, 'sandbox_direct_failed', message)
+@dataclass
+class Frames:
+    """Frames `follow_command` serves instead of following a command."""
 
-
-def _tail(data: bytes, limit: int) -> tuple[str, bool]:
-    return data[-limit:].decode(errors='replace'), len(data) > limit
+    frames: list[dict[str, object]]
 
 
 @dataclass
 class Call:
-    """A request that reached one of the fake's routes."""
+    """A call that reached one of the fake's routes."""
 
     route: str
-    request: httpx.Request
-    body: dict[str, object]
+    arguments: dict[str, object] = field(default_factory=dict[str, object])
 
 
 class FakeCommand:
@@ -122,7 +194,7 @@ class FakeCommand:
 
 
 class FakeSandbox:
-    def __init__(self, sandbox_id: str, root: Path, *, machine_type: str, boot_polls: int) -> None:
+    def __init__(self, sandbox_id: str, root: Path, *, machine_type: str) -> None:
         self.id = sandbox_id
         self.state = 'provisioning'
         self.machine_type = machine_type
@@ -131,21 +203,25 @@ class FakeSandbox:
         self.logs = root / sandbox_id / 'logs'
         for directory in (self.home, self.tmp, self.logs):
             directory.mkdir(parents=True)
-        # How many lookups report the sandbox as still starting.
-        self.boot_polls = boot_polls
+        # The states successive lookups find it in, such as while it starts; then it is ready.
+        self.next_states: list[str] = []
         # Boat's auto-stop in seconds, `None` when it is off.
         self.ttl: int | None = 3600
         self.resume_calls = 0
         self.commands: dict[int, FakeCommand] = {}
 
-    def info(self) -> dict[str, object]:
-        return {
-            'id': self.id,
-            'name': f'Box {self.id}',
-            'state': self.state,
-            'type': self.machine_type,
-            'ttlSeconds': self.ttl,
-        }
+    def model(self) -> boat_sdk.Sandbox:
+        return boat_sdk.Sandbox.model_validate(
+            {
+                'id': self.id,
+                'name': f'Box {self.id}',
+                'state': self.state,
+                'type': self.machine_type,
+                'ttlSeconds': self.ttl,
+                'desktopAvailable': False,
+                'snapshotAvailable': False,
+            }
+        )
 
     def environment(self) -> dict[str, str]:
         return {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(self.home), 'TMPDIR': str(self.tmp)}
@@ -155,86 +231,186 @@ class FakeSandbox:
             command.kill()
 
 
-class FakeClient(httpx.AsyncClient):
-    """An API client whose requests the fake answers, counting its own closing."""
+class Answer:
+    """What the SDK's connection pool returns: enough of `urllib3.BaseHTTPResponse` for the backend and the SDK."""
+
+    def __init__(self, status: int, data: bytes) -> None:
+        self.status = status
+        self.reason = HTTPStatus(status).phrase
+        self.data = data
+        self.headers: dict[str, str] = {}
+
+
+class _Pool:
+    """The SDK client's connection pool, which the backend sends signed file transfers through."""
+
+    def __init__(self, fake: FakeBoat) -> None:
+        self._fake = fake
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: object = None,
+    ) -> Answer:
+        # The URL is signed: Boat's API key must not travel to the sandbox's machine.
+        assert 'Authorization' not in (headers or {}), 'the Boat API key was sent to a file-transfer URL'
+        if isinstance(answer := self._fake.enter('transfer', method=method, url=url), Answer):
+            return answer
+        return self._fake.transfer(method, url, body or b'')
+
+
+class _Rest:
+    def __init__(self, fake: FakeBoat) -> None:
+        self.pool_manager = _Pool(fake)
+
+
+class _ApiClient:
+    def __init__(self, fake: FakeBoat) -> None:
+        self.rest_client = _Rest(fake)
+
+
+class FakeClient:
+    """Stands in for `boat_sdk.BoatApi`: each method is the SDK call of the same name, answered by the fake."""
 
     def __init__(self, fake: FakeBoat, api_key: str) -> None:
-        super().__init__(
-            transport=httpx.MockTransport(fake.handle),
-            base_url=BOAT_API_URL,
-            headers={'Authorization': f'Bearer {api_key}'},
-        )
         self.fake = fake
+        self.api_key = api_key
+        self.api_client = _ApiClient(fake)
+        # The SDK's own client the backend built this one with, if it did.
+        self.sdk_client: boat_sdk.ApiClient | None = None
 
-    async def aclose(self) -> None:
-        if self.fake.close_gate is not None:
-            await self.fake.close_gate.wait()
-        if (error := next(self.fake.close_errors, None)) is not None:
-            raise error
-        await super().aclose()
-        self.fake.closed_clients += 1
+    def check_key(self) -> None:
+        if self.api_key != self.fake.api_key:
+            raise boat_error(401, 'unauthorized', 'unauthorized')
 
+    def create(
+        self,
+        idempotency_key: str | None = None,
+        create_sandbox_request: boat_sdk.CreateSandboxRequest | None = None,
+        _request_timeout: object = None,
+    ) -> boat_sdk.CreateSandboxResponse:
+        self.check_key()
+        assert create_sandbox_request is not None
+        body = create_sandbox_request.to_dict()
+        self.fake.enter('create', idempotency_key=idempotency_key, body=body)
+        answer = self.fake.create(idempotency_key, body)
+        self.fake.lose_reply('create')
+        return answer
 
-Handler = Callable[[httpx.Request, re.Match[str], dict[str, object]], Awaitable[httpx.Response]]
+    def get(self, sandbox_id: str, _request_timeout: object = None) -> boat_sdk.SandboxInfoResponse:
+        self.check_key()
+        self.fake.enter('get', sandbox_id=sandbox_id)
+        return self.fake.get(sandbox_id)
+
+    def update(
+        self, sandbox_id: str, update_sandbox_request: boat_sdk.UpdateSandboxRequest, _request_timeout: object = None
+    ) -> boat_sdk.SandboxInfoResponse:
+        self.check_key()
+        body = update_sandbox_request.to_dict()
+        self.fake.enter('update', sandbox_id=sandbox_id, body=body)
+        return self.fake.update(sandbox_id, body)
+
+    def resume(self, sandbox_id: str, _request_timeout: object = None) -> boat_sdk.SandboxActionResponse:
+        self.check_key()
+        self.fake.enter('resume', sandbox_id=sandbox_id)
+        return self.fake.resume(sandbox_id)
+
+    def delete_sandbox(
+        self, x_ascii_confirm_delete: str, sandbox_id: str, _request_timeout: object = None
+    ) -> boat_sdk.DeletionOperationResponse:
+        self.check_key()
+        self.fake.enter('delete', sandbox_id=sandbox_id, confirm=x_ascii_confirm_delete)
+        return self.fake.delete(sandbox_id, x_ascii_confirm_delete)
+
+    def command(
+        self, sandbox_id: str, command_request: boat_sdk.CommandRequest, _request_timeout: object = None
+    ) -> boat_sdk.Command200Response:
+        self.check_key()
+        body = command_request.to_dict()
+        route = 'start' if command_request.detached else 'run'
+        if isinstance(answer := self.fake.enter(route, sandbox_id=sandbox_id, body=body), boat_sdk.Command200Response):
+            return answer
+        result = self.fake.command(sandbox_id, command_request)
+        self.fake.lose_reply(route)
+        return result
+
+    def stop_command(
+        self, sandbox_id: str, process_id: int, _request_timeout: object = None
+    ) -> boat_sdk.CommandStopResponse:
+        self.check_key()
+        self.fake.enter('stop', sandbox_id=sandbox_id, process_id=process_id)
+        return self.fake.stop_command(sandbox_id, process_id)
+
+    def read_file(
+        self, sandbox_id: str, path: str, encoding: str | None = None, _request_timeout: object = None
+    ) -> boat_sdk.FileReadResponse:
+        self.check_key()
+        self.fake.enter('read', sandbox_id=sandbox_id, path=path, encoding=encoding)
+        return self.fake.read_file(sandbox_id, path, encoding)
+
+    def write_file(
+        self, sandbox_id: str, file_write_request: boat_sdk.FileWriteRequest, _request_timeout: object = None
+    ) -> boat_sdk.FileWriteResponse:
+        self.check_key()
+        self.fake.enter('write', sandbox_id=sandbox_id, path=file_write_request.path)
+        answer = self.fake.write_file(sandbox_id, file_write_request)
+        self.fake.lose_reply('write')
+        return answer
+
+    def create_download_url(
+        self, sandbox_id: str, file_url_request: boat_sdk.FileUrlRequest, _request_timeout: object = None
+    ) -> boat_sdk.FileUrlResponse:
+        self.check_key()
+        self.fake.enter('download_url', sandbox_id=sandbox_id, path=file_url_request.path)
+        return self.fake.transfer_url(sandbox_id, file_url_request.path, 'read')
+
+    def create_upload_url(
+        self, sandbox_id: str, file_url_request: boat_sdk.FileUrlRequest, _request_timeout: object = None
+    ) -> boat_sdk.FileUrlResponse:
+        self.check_key()
+        self.fake.enter('upload_url', sandbox_id=sandbox_id, path=file_url_request.path)
+        return self.fake.transfer_url(sandbox_id, file_url_request.path, 'write')
 
 
 class FakeBoat:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, api_key: str) -> None:
         self.root = root
-        self.api_key = 'test-key'
+        self.api_key = api_key
         self.sandboxes: dict[str, FakeSandbox] = {}
         self.deleted: set[str] = set()
         # Named snapshots a create may start from.
         self.snapshots: set[str] = set()
-        self.boot_polls = 0
         self.create_bodies: list[dict[str, object]] = []
-        self.requests: list[httpx.Request] = []
         self.calls: list[Call] = []
-        self.errors: dict[str, list[httpx.Response | Exception | None]] = defaultdict(list)
+        self.errors: dict[str, list[object]] = defaultdict(list)
         self.lost_replies: dict[str, int] = defaultdict(int)
-        self.gates: dict[str, asyncio.Event] = {}
-        self.reached: dict[str, asyncio.Event] = defaultdict(asyncio.Event)
+        self.gates: dict[str, threading.Event] = {}
+        self.reached: dict[str, threading.Event] = defaultdict(threading.Event)
         self.clients: list[FakeClient] = []
-        self.opened_clients = 0
-        self.closed_clients = 0
-        # Raised by successive client `aclose` calls; closing succeeds once it is exhausted.
-        self.close_errors: Iterator[Exception] = iter(())
-        self.close_gate: asyncio.Event | None = None
+        self._lock = threading.Lock()
         self._created = 0
+        self._started = 0
         self._idempotency: dict[str, tuple[dict[str, object], str]] = {}
-        sandbox, command = r'/sandboxes/(?P<id>[^/]+)', r'/commands/(?P<pid>[^/]+)'
-        self._routes: list[tuple[str, re.Pattern[str], str, Handler]] = [
-            ('POST', re.compile(r'/sandboxes'), 'create', self._create),
-            ('GET', re.compile(sandbox), 'get', self._get),
-            ('PATCH', re.compile(sandbox), 'update', self._update),
-            ('DELETE', re.compile(sandbox), 'delete', self._delete),
-            ('POST', re.compile(f'{sandbox}/resume'), 'resume', self._resume),
-            ('POST', re.compile(f'{sandbox}/commands'), 'command', self._command),
-            ('GET', re.compile(f'{sandbox}{command}'), 'status', self._status),
-            ('DELETE', re.compile(f'{sandbox}{command}'), 'kill', self._kill),
-            ('GET', re.compile(f'{sandbox}/files'), 'read', self._read),
-            ('PUT', re.compile(f'{sandbox}/files'), 'write', self._write),
-            ('POST', re.compile(f'{sandbox}/files/(?P<op>upload|download)-url'), 'transfer_url', self._transfer_url),
-        ]
 
     # --- Control surface ---------------------------------------------------------------------------------------------
 
-    def client(self, api_key: str) -> FakeClient:
-        """Stands in for `open_client`: an API client served by this fake."""
-        self.opened_clients += 1
-        client = FakeClient(self, api_key)
+    def client(self, api_client: boat_sdk.ApiClient | None = None) -> FakeClient:
+        """Stands in for `boat_sdk.BoatApi(api_client)`, authenticated with the key of the client's configuration."""
+        key: object = getattr(getattr(api_client, 'configuration', None), 'access_token', None)
+        client = FakeClient(self, key if isinstance(key, str) else '')
+        client.sdk_client = api_client
         self.clients.append(client)
         return client
 
-    def supplied_client(self) -> FakeClient:
-        """A caller-owned API client, as an application passes with `client=`; not one the backend opened."""
-        client = FakeClient(self, self.api_key)
-        self.clients.append(client)
-        return client
+    def routes(self) -> list[str]:
+        return [call.route for call in self.calls]
 
-    def bodies(self, route: str) -> list[dict[str, object]]:
-        """The JSON bodies of the requests that reached `route`, in order."""
-        return [call.body for call in self.calls if call.route == route]
+    def bodies(self, route: str) -> list[object]:
+        """The request bodies of the calls that reached `route`, in order."""
+        return [call.arguments['body'] for call in self.calls if call.route == route]
 
     def sandbox(self, state: str = 'idle') -> FakeSandbox:
         """A sandbox that exists before the test, as one an earlier run created."""
@@ -246,174 +422,181 @@ class FakeBoat:
         """Stop a sandbox as Boat's auto-stop does; its processes keep running, as on Boat's first minutes."""
         self.sandboxes[sandbox_id].state = 'archived'
 
-    async def close(self) -> None:
+    def close(self) -> None:
+        for gate in self.gates.values():
+            gate.set()
         for sandbox in self.sandboxes.values():
             sandbox.kill_all()
-        for client in self.clients:
-            if not client.is_closed:
-                await httpx.AsyncClient.aclose(client)
 
     # --- Dispatch ----------------------------------------------------------------------------------------------------
 
-    async def handle(self, request: httpx.Request) -> httpx.Response:
-        await request.aread()
-        self.requests.append(request)
-        url = request.url
-        if url.host == MACHINE_HOST:
-            route, body, call = 'transfer', {}, partial(self._transfer, request)
-        else:
-            assert url.host == 'boat.dev' and url.path.startswith('/api/v1/'), f'not a Boat API URL: {url}'
-            if request.headers.get('authorization') != f'Bearer {self.api_key}':
-                return boat_error(401, 'unauthorized', 'unauthorized')
-            route, body, call = self._route(request)
-        self.calls.append(Call(route, request, body))
+    def enter(self, route: str, **arguments: object) -> object:
+        """Record a call and hold it at its gate; raise what a test injected for it, or return a non-exception answer."""
+        self.calls.append(Call(route, arguments))
         self.reached[route].set()
         if (gate := self.gates.get(route)) is not None:
-            await gate.wait()
-        if self.errors[route] and (injected := self.errors[route].pop(0)) is not None:
-            if isinstance(injected, Exception):
-                raise injected
-            return injected
-        response = await call()
+            assert gate.wait(30), f'the {route!r} gate was never opened'
+        injected = self.errors[route].pop(0) if self.errors[route] else None
+        if isinstance(injected, BaseException):
+            raise injected
+        return injected
+
+    def lose_reply(self, route: str) -> None:
+        """Fail a handled call as its reply lost, if a test asked for that."""
         if self.lost_replies[route]:
             self.lost_replies[route] -= 1
-            raise httpx.ReadTimeout('reply lost', request=request)
-        return response
+            # The SDK sends a `PUT` again until it gives up; a `POST` it does not.
+            raise gave_up_reading() if route == 'write' else lost_reply()
 
-    def _route(self, request: httpx.Request) -> tuple[str, dict[str, object], Callable[[], Awaitable[httpx.Response]]]:
-        path = request.url.path.removeprefix('/api/v1')
-        for method, pattern, route, handler in self._routes:
-            if request.method == method and (match := pattern.fullmatch(path)) is not None:
-                body = _BODY.validate_json(request.content) if request.content else {}
-                if route == 'command':
-                    route = 'start' if body.get('detached') is True else 'run'
-                elif route == 'transfer_url':
-                    route = f'{match["op"]}_url'
-                return route, body, partial(handler, request, match, body)
-        raise AssertionError(f'Boat has no {request.method} {path}')  # pragma: no cover - tripwire
+    def _sandbox(self, sandbox_id: str) -> FakeSandbox:
+        sandbox = self.sandboxes.get(sandbox_id)
+        if sandbox is None:
+            raise boat_error(404, 'not_found', 'not_found')
+        return sandbox
 
-    def _sandbox(self, match: re.Match[str]) -> FakeSandbox | httpx.Response:
-        sandbox = self.sandboxes.get(match['id'])
-        return boat_error(404, 'not_found', 'not_found') if sandbox is None else sandbox
-
-    def _running(self, match: re.Match[str], *, files: bool = False) -> FakeSandbox | httpx.Response:
+    def _running(self, sandbox_id: str, *, files: bool = False) -> FakeSandbox:
         """The sandbox an agent call reaches, or Boat's refusal while it is stopped.
 
         While a stop is still archiving the sandbox, its machine answers file calls but refuses commands.
         """
-        sandbox = self._sandbox(match)
-        if isinstance(sandbox, FakeSandbox) and sandbox.state == 'archived':
-            return boat_error(409, 'machine_not_running', 'Sandbox machine is not running.')
-        if isinstance(sandbox, FakeSandbox) and sandbox.state == 'archiving' and not files:
+        sandbox = self._sandbox(sandbox_id)
+        if sandbox.state == 'archived':
+            raise boat_error(409, 'machine_not_running', 'Sandbox machine is not running.')
+        if sandbox.state == 'archiving' and not files:
             message = 'Sandbox is not ready (state: archiving). Resume or recover it before running commands.'
-            return boat_error(409, 'sandbox_not_ready', message, retryable=False, state='archiving')
+            raise boat_error(409, 'sandbox_not_ready', message, retryable=False, state='archiving')
         return sandbox
 
     def _new_sandbox(self, machine_type: str) -> FakeSandbox:
-        number, self._created = self._created, self._created + 1
+        with self._lock:
+            number, self._created = self._created, self._created + 1
         suffix = ''
         for _ in range(8):
             number, digit = divmod(number, len(_ID_ALPHABET))
             suffix = _ID_ALPHABET[digit] + suffix
-        sandbox = FakeSandbox(f'bx_{suffix}', self.root, machine_type=machine_type, boot_polls=self.boot_polls)
+        sandbox = FakeSandbox(f'bx_{suffix}', self.root, machine_type=machine_type)
         self.sandboxes[sandbox.id] = sandbox
         return sandbox
 
     # --- Sandboxes ---------------------------------------------------------------------------------------------------
 
-    async def _create(self, request: httpx.Request, match: re.Match[str], body: dict[str, object]) -> httpx.Response:
-        key = request.headers.get('idempotency-key')
-        assert key is not None, 'every creation is sent with an Idempotency-Key, so a retry finds its sandbox'
+    def create(self, key: str | None, body: dict[str, object]) -> boat_sdk.CreateSandboxResponse:
+        assert key is not None, 'every creation is sent with an idempotency key, so a retry finds its sandbox'
         if key in self._idempotency:
             earlier, sandbox_id = self._idempotency[key]
             if earlier != body:  # pragma: no cover - tripwire: a retry must repeat the body it was first sent with
                 message = 'This Idempotency-Key was already used with a different request body.'
-                return boat_error(409, 'idempotency_key_reused', message)
-            sandbox = self.sandboxes.get(sandbox_id)
-            info = sandbox.info() if sandbox is not None else {'id': sandbox_id, 'state': 'archived'}
-            return boat_ok('sandbox.created', 202, status='ready', sandbox=info)
+                raise boat_error(409, 'idempotency_key_reused', message)
+            sandbox = self.sandboxes[sandbox_id]
+            return self._created_answer('ready', sandbox)
         machine_type = body.get('type', 'default')
-        if machine_type not in MACHINE_TYPES:
-            return boat_error(400, 'invalid_type', 'type must be one of small, default, large, xlarge')
+        # The SDK refuses any other size before sending it.
+        assert machine_type in MACHINE_TYPES
         snapshot = body.get('from')
         if snapshot is not None and snapshot not in self.snapshots:
-            message = f'No named snapshot "{snapshot}". Run boat snapshots to list yours.'
-            return boat_error(404, 'snapshot_not_found', message)
+            raise boat_error(
+                404, 'snapshot_not_found', f'No named snapshot "{snapshot}". Run boat snapshots to list yours.'
+            )
         ttl = body.get('ttlSeconds', 3600)
-        if ttl is not None and (type(ttl) is not int or not 0 <= ttl <= 2592000):  # pragma: no cover - tripwire
-            return boat_error(400, 'invalid_ttl', 'ttlSeconds must be an integer between 1 and 2592000, or null.')
-        assert isinstance(machine_type, str)
+        assert isinstance(machine_type, str) and (ttl is None or isinstance(ttl, int))
         sandbox = self._new_sandbox(machine_type)
-        # Boat reads `0` as its default.
-        sandbox.ttl = 3600 if ttl == 0 else ttl
+        sandbox.ttl = ttl
         self.create_bodies.append(body)
         self._idempotency[key] = (body, sandbox.id)
-        return boat_ok('sandbox.created', 202, status='provisioning', ttlSeconds=sandbox.ttl, sandbox=sandbox.info())
+        return self._created_answer('provisioning', sandbox)
 
-    async def _get(self, request: httpx.Request, match: re.Match[str], body: dict[str, object]) -> httpx.Response:
-        sandbox = self._sandbox(match)
-        if isinstance(sandbox, httpx.Response):
-            return sandbox
-        if sandbox.state in ('provisioning', 'provisioned', 'cloning'):
-            if sandbox.boot_polls:
-                sandbox.boot_polls -= 1
-                sandbox.state = 'cloning'
-            else:
-                sandbox.state = 'idle'
-        return boat_ok('sandbox.info', sandbox=sandbox.info())
+    @staticmethod
+    def _created_answer(status: str, sandbox: FakeSandbox) -> boat_sdk.CreateSandboxResponse:
+        return boat_sdk.CreateSandboxResponse.model_validate(
+            {
+                'ok': True,
+                'type': 'sandbox.created',
+                'status': status,
+                'ttlSeconds': sandbox.ttl,
+                'sandbox': sandbox.model().to_dict(),
+            }
+        )
 
-    async def _update(self, request: httpx.Request, match: re.Match[str], body: dict[str, object]) -> httpx.Response:
-        sandbox = self._sandbox(match)
-        if isinstance(sandbox, httpx.Response):
-            return sandbox
-        ttl = body.get('ttlSeconds')
+    def get(self, sandbox_id: str) -> boat_sdk.SandboxInfoResponse:
+        sandbox = self._sandbox(sandbox_id)
+        if sandbox.next_states:
+            sandbox.state = sandbox.next_states.pop(0)
+        elif sandbox.state in ('provisioning', 'cloning'):
+            sandbox.state = 'idle'
+        return self._info('sandbox.info', sandbox)
+
+    @staticmethod
+    def _info(kind: str, sandbox: FakeSandbox) -> boat_sdk.SandboxInfoResponse:
+        return boat_sdk.SandboxInfoResponse.model_validate(
+            {'ok': True, 'type': kind, 'sandbox': sandbox.model().to_dict()}
+        )
+
+    def update(self, sandbox_id: str, body: dict[str, object]) -> boat_sdk.SandboxInfoResponse:
+        sandbox = self._sandbox(sandbox_id)
         # The backend only sets the auto-stop again, with the sandbox's own.
-        assert body == {'ttlSeconds': sandbox.ttl} and type(ttl) is int and 1 <= ttl <= 2592000
-        return boat_ok('sandbox.updated', sandbox=sandbox.info())
+        assert body == {'ttlSeconds': sandbox.ttl} and sandbox.ttl is not None
+        return self._info('sandbox.updated', sandbox)
 
-    async def _resume(self, request: httpx.Request, match: re.Match[str], body: dict[str, object]) -> httpx.Response:
-        sandbox = self._sandbox(match)
+    def resume(self, sandbox_id: str) -> boat_sdk.SandboxActionResponse:
+        sandbox = self._sandbox(sandbox_id)
         # The backend resumes only a sandbox it just found stopped.
-        assert isinstance(sandbox, FakeSandbox) and sandbox.state in ('archived', 'archiving')
+        assert sandbox.state in ('archived', 'archiving')
         sandbox.resume_calls += 1
         sandbox.state = 'ready'
-        return boat_ok('sandbox.resuming', id=sandbox.id, status='running', sandbox=sandbox.info())
+        return boat_sdk.SandboxActionResponse.model_validate(
+            {
+                'ok': True,
+                'type': 'sandbox.resuming',
+                'id': sandbox.id,
+                'status': 'running',
+                'sandbox': sandbox.model().to_dict(),
+            }
+        )
 
-    async def _delete(self, request: httpx.Request, match: re.Match[str], body: dict[str, object]) -> httpx.Response:
-        sandbox_id = match['id']
-        operation = {'id': f'bdop_{sandbox_id}', 'kind': 'sandbox', 'targetId': sandbox_id, 'status': 'pending'}
+    def delete(self, sandbox_id: str, confirm: str) -> boat_sdk.DeletionOperationResponse:
+        operation = {
+            'id': f'bdop_{uuid.uuid4().hex}',
+            'kind': 'sandbox',
+            'targetId': sandbox_id,
+            'reason': 'explicit',
+            'status': 'pending',
+            'attemptCount': 0,
+            'requestedAt': datetime.now(UTC).isoformat(),
+            'completedAt': None,
+        }
+        answer = boat_sdk.DeletionOperationResponse.model_validate(
+            {'ok': True, 'type': 'sandbox.deleting', 'operation': operation}
+        )
         if sandbox_id in self.deleted:
-            return boat_ok('sandbox.deleting', 202, operation=operation)
-        sandbox = self._sandbox(match)
-        if isinstance(sandbox, httpx.Response):
-            return sandbox
-        if request.headers.get('x-ascii-confirm-delete') != sandbox_id:  # pragma: no cover - tripwire
+            return answer
+        sandbox = self._sandbox(sandbox_id)
+        if confirm != sandbox_id:  # pragma: no cover - tripwire
             message = f'Set X-Ascii-Confirm-Delete to the exact target id: {sandbox_id}'
-            return boat_error(409, 'delete_confirmation_required', message, targetId=sandbox_id)
-        # Deleting a sandbox stops its machine at once, and every process on it.
-        sandbox.kill_all()
+            raise boat_error(409, 'delete_confirmation_required', message, targetId=sandbox_id)
+        # Deleting a sandbox stops its machine at once, and every process on it. Forgotten first, so a
+        # command's output stream breaks off rather than reporting an exit.
         del self.sandboxes[sandbox_id]
         self.deleted.add(sandbox_id)
-        return boat_ok('sandbox.deleting', 202, operation=operation)
+        sandbox.kill_all()
+        return answer
 
     # --- Commands ----------------------------------------------------------------------------------------------------
 
-    async def _command(self, request: httpx.Request, match: re.Match[str], body: dict[str, object]) -> httpx.Response:
-        sandbox = self._running(match)
-        if isinstance(sandbox, httpx.Response):
-            return sandbox
-        command = body.get('command')
-        assert isinstance(command, str) and command
-        if len(command.encode()) > _COMMAND_LIMIT:
-            return _direct_failed("E2BIG: argument list too long, posix_spawn 'systemd-run'")
-        if body.get('detached') is True:
-            return self._start(sandbox, command)
-        timeout = body.get('timeoutSeconds', 30)
-        assert type(timeout) is int and 1 <= timeout <= 600, 'Boat refuses a timeout outside 1-600 seconds'
-        return await anyio.to_thread.run_sync(_run_sync, sandbox, command, timeout)
+    def command(self, sandbox_id: str, request: boat_sdk.CommandRequest) -> boat_sdk.Command200Response:
+        sandbox = self._running(sandbox_id)
+        assert request.command and request.cwd is None
+        if len(request.command.encode()) > _COMMAND_LIMIT:
+            raise boat_error(400, 'sandbox_direct_failed', "E2BIG: argument list too long, posix_spawn 'systemd-run'")
+        if request.detached:
+            return self._start(sandbox, request.command)
+        timeout = request.timeout_seconds
+        assert timeout is not None and 1 <= timeout <= 600, 'Boat refuses a timeout outside 1-600 seconds'
+        return _run_sync(sandbox, request.command, timeout)
 
-    def _start(self, sandbox: FakeSandbox, command: str) -> httpx.Response:
-        out, err = sandbox.logs / f'{len(sandbox.commands)}.log', sandbox.logs / f'{len(sandbox.commands)}.err.log'
+    def _start(self, sandbox: FakeSandbox, command: str) -> boat_sdk.Command200Response:
+        with self._lock:
+            number, self._started = self._started, self._started + 1
+        out, err = sandbox.logs / f'{number}.log', sandbox.logs / f'{number}.err.log'
         with out.open('wb') as stdout, err.open('wb') as stderr:
             process = subprocess.Popen(
                 ['bash', '-c', command],
@@ -425,169 +608,171 @@ class FakeBoat:
                 start_new_session=True,
             )
         sandbox.commands[process.pid] = FakeCommand(process, out, err)
-        return boat_ok(
-            'command.started', success=True, processId=process.pid, pid=process.pid, command=command, cwd='.'
-        )
+        return detached(process.pid, command)
 
-    async def _status(self, request: httpx.Request, match: re.Match[str], body: dict[str, object]) -> httpx.Response:
-        sandbox = self._running(match)
-        if isinstance(sandbox, httpx.Response):
-            return sandbox
-        assert match['pid'].isdigit() and int(match['pid']) >= 1, 'Boat refuses a process ID that is not positive'
-        command = sandbox.commands.get(int(match['pid']))
-        if command is None:
-            return boat_ok(
-                'command.status', status='lost', known=False, running=False, exitCode=None, stdout='', stderr=''
-            )
-        code = command.process.poll()
-        status: dict[str, object] = {
-            'processId': command.process.pid,
-            'status': 'running' if code is None else 'exited',
-            'running': code is None,
-            'exitCode': None if code is None else code if code >= 0 else 128 - code,
-        }
-        out, err = command.out.read_bytes(), command.err.read_bytes()
-        query = request.url.params
-        if 'stdoutOffset' in query or 'stderrOffset' in query:
-            start_out, start_err = int(query.get('stdoutOffset', len(out))), int(query.get('stderrOffset', len(err)))
-            page_out, page_err = out[start_out : start_out + _OFFSET_PAGE], err[start_err : start_err + _OFFSET_PAGE]
-            status |= {
-                'stdout': page_out.decode(errors='replace'),
-                'stderr': page_err.decode(errors='replace'),
-                'stdoutOffset': start_out,
-                'stderrOffset': start_err,
-                'stdoutNextOffset': start_out + len(page_out),
-                'stderrNextOffset': start_err + len(page_err),
-                'more': start_out + len(page_out) < len(out) or start_err + len(page_err) < len(err),
-            }
+    def follow_command(self, api: object, sandbox_id: str, process_id: int) -> Iterator[dict[str, object]]:
+        """Stands in for `boat_helpers.follow_command`: a detached command's output from its start, then its exit.
+
+        As the SDK's helper, it reconnects through a dropped stream, so a sandbox deleted or stopped
+        meanwhile surfaces as the refusal its reconnection gets.
+        """
+        assert isinstance(api, FakeClient)
+        api.check_key()
+        if isinstance(frames := self.enter('follow', sandbox_id=sandbox_id, process_id=process_id), Frames):
+            yield from frames.frames
+        elif (command := self._running(sandbox_id).commands.get(process_id)) is None:
+            yield {'type': 'exit', 'status': 'lost', 'exitCode': None}
         else:
-            # Boat ignores a `tailBytes` that is not a positive integer.
-            raw = query.get('tailBytes', '')
-            limit = int(raw) if raw.isdigit() and int(raw) > 0 else _STREAM_LIMIT
-            (stdout, stdout_cut), (stderr, stderr_cut) = _tail(out, limit), _tail(err, limit)
-            status |= {
-                'known': True,
-                'stdout': stdout,
-                'stderr': stderr,
-                'stdoutTruncated': stdout_cut,
-                'stderrTruncated': stderr_cut,
-            }
-        return boat_ok('command.status', success=True, **status)
+            yield from self._output(sandbox_id, command)
 
-    async def _kill(self, request: httpx.Request, match: re.Match[str], body: dict[str, object]) -> httpx.Response:
-        sandbox = self._running(match)
-        if isinstance(sandbox, httpx.Response):
-            return sandbox
-        command = sandbox.commands.get(int(match['pid']))
+    def _output(self, sandbox_id: str, command: FakeCommand) -> Iterator[dict[str, object]]:
+        """A command's output as its log files grow, then its exit."""
+        offsets = {'stdout': 0, 'stderr': 0}
+        decoders = {name: codecs.getincrementaldecoder('utf-8')(errors='replace') for name in offsets}
+        code = None
+        while code is None:
+            code = command.process.poll()
+            for name, path in (('stdout', command.out), ('stderr', command.err)):
+                data = path.read_bytes()[offsets[name] :]
+                offsets[name] += len(data)
+                if text := decoders[name].decode(data, final=code is not None):
+                    yield {'type': name, 'data': text, 'nextOffset': offsets[name]}
+            # A sandbox deleted or stopped meanwhile breaks the stream off, and its reconnection is refused.
+            self._running(sandbox_id)
+            if code is None:
+                time.sleep(0.005)
+        yield {'type': 'exit', 'status': 'exited', 'exitCode': code if code >= 0 else 128 - code}
+
+    def stop_command(self, sandbox_id: str, process_id: int) -> boat_sdk.CommandStopResponse:
+        sandbox = self._running(sandbox_id)
+        command = sandbox.commands.get(process_id)
         if command is None:
-            return _direct_failed(f'Process {match["pid"]} was not started by a detached command.')
+            raise boat_error(
+                400, 'sandbox_direct_failed', f'Process {process_id} was not started by a detached command.'
+            )
         signaled = command.process.poll() is None
         command.kill()
         command.stopped = True
-        return boat_ok('command.stopped', processId=command.process.pid, running=False, signaled=signaled)
+        return boat_sdk.CommandStopResponse.model_validate(
+            {
+                'ok': True,
+                'type': 'command.stopped',
+                'processId': process_id,
+                'running': False,
+                'signaled': signaled,
+                'command': None,
+            }
+        )
 
     # --- Files -------------------------------------------------------------------------------------------------------
 
-    def _resolve(self, sandbox: FakeSandbox, raw: object) -> Path | httpx.Response:
+    def _resolve(self, sandbox: FakeSandbox, raw: str) -> Path:
         """The host path of a file-API path, or Boat's refusal of a path outside its roots."""
-        assert isinstance(raw, str)
         path = Path(os.path.normpath(sandbox.home / raw))
         if not _under(path, sandbox.home, sandbox.tmp):
-            return boat_error(400, 'invalid_path', _ROOTS_MESSAGE)
+            raise boat_error(400, 'invalid_path', _ROOTS_MESSAGE)
         # A symlink is followed, and its target must resolve under the roots as well.
         if not _under(Path(os.path.realpath(path)), sandbox.home, sandbox.tmp):
-            return _direct_failed(_ROOTS_MESSAGE)
+            raise boat_error(400, 'sandbox_direct_failed', _ROOTS_MESSAGE)
         return path
 
-    async def _read(self, request: httpx.Request, match: re.Match[str], body: dict[str, object]) -> httpx.Response:
-        sandbox = self._running(match, files=True)
-        if isinstance(sandbox, httpx.Response):
-            return sandbox
-        path = self._resolve(sandbox, request.url.params.get('path'))
-        if isinstance(path, httpx.Response):
-            return path
+    def read_file(self, sandbox_id: str, raw: str, encoding: str | None) -> boat_sdk.FileReadResponse:
+        sandbox = self._running(sandbox_id, files=True)
+        path = self._resolve(sandbox, raw)
         try:
             info = path.stat()
         except OSError as error:
-            return _direct_failed(_node_error(error, 'stat', path))
+            raise boat_error(400, 'sandbox_direct_failed', _node_error(error, 'stat', path)) from None
         if not stat.S_ISREG(info.st_mode):
             # A FIFO too, without opening it.
-            return _direct_failed('Path is not a file.')
+            raise boat_error(400, 'sandbox_direct_failed', 'Path is not a file.')
         if info.st_size > _FILE_LIMIT:
-            return _direct_failed(
+            raise boat_error(
+                400,
+                'sandbox_direct_failed',
                 f'File is too large for read_file ({info.st_size} bytes > {_FILE_LIMIT}). '
-                f'Use a download URL instead: POST /sandboxes/{sandbox.id}/files/download-url.'
+                f'Use a download URL instead: POST /sandboxes/{sandbox.id}/files/download-url.',
             )
         # Boat's file API reads as root, so a file it found is a file it can read.
         data = path.read_bytes()
-        encoding = request.url.params.get('encoding')
-        content = base64.b64encode(data).decode() if encoding == 'base64' else data.decode(errors='replace')
-        return boat_ok(
-            'file.read', success=True, path=str(path), encoding=encoding or 'utf8', size=len(data), content=content
+        assert encoding == 'base64', 'a file read without base64 loses bytes that are not UTF-8'
+        return boat_sdk.FileReadResponse.model_validate(
+            {
+                'ok': True,
+                'type': 'file.read',
+                'success': True,
+                'path': str(path),
+                'encoding': encoding,
+                'size': len(data),
+                'content': base64.b64encode(data).decode(),
+            }
         )
 
-    async def _write(self, request: httpx.Request, match: re.Match[str], body: dict[str, object]) -> httpx.Response:
-        sandbox = self._running(match, files=True)
-        if isinstance(sandbox, httpx.Response):
-            return sandbox
-        path = self._resolve(sandbox, body.get('path'))
-        if isinstance(path, httpx.Response):
-            return path
-        content = body.get('content')
-        text = content if isinstance(content, str) else ''
-        data = base64.b64decode(text) if body.get('encoding') == 'base64' else text.encode()
-        if len(data) > _FILE_LIMIT:  # pragma: no cover - tripwire: a larger file goes through an upload URL
-            return _direct_failed(
-                f'File is too large for write_file ({len(data)} bytes > {_FILE_LIMIT}). '
-                f'Use an upload URL instead: POST /sandboxes/{sandbox.id}/files/upload-url.'
-            )
+    def write_file(self, sandbox_id: str, request: boat_sdk.FileWriteRequest) -> boat_sdk.FileWriteResponse:
+        sandbox = self._running(sandbox_id, files=True)
+        path = self._resolve(sandbox, request.path)
+        assert request.encoding == 'base64', 'a file written without base64 cannot hold bytes that are not UTF-8'
+        data = base64.b64decode(request.content)
+        assert len(data) <= _FILE_LIMIT, 'a larger file goes through an upload URL'
         if path.is_symlink() and not path.exists():
-            return _direct_failed(_ROOTS_MESSAGE)
+            raise boat_error(400, 'sandbox_direct_failed', _ROOTS_MESSAGE)
         if path.exists() and not path.is_file() and not path.is_dir():
             # Boat's agent answers a write to a FIFO only once something opens it for reading, so the
-            # client's request times out first; opening it here would block the event loop.
-            raise httpx.ReadTimeout('timed out', request=request)
+            # SDK's request times out, and so do its repeats; opening it here would block.
+            raise gave_up_reading()
         if (error := _write_file(path, data)) is not None:
-            return _direct_failed(error)
-        return boat_ok('file.written', success=True, path=str(path), size=len(data))
+            raise boat_error(400, 'sandbox_direct_failed', error)
+        return boat_sdk.FileWriteResponse.model_validate(
+            {
+                'ok': True,
+                'type': 'file.written',
+                'success': True,
+                'path': str(path),
+                'encoding': 'base64',
+                'size': len(data),
+            }
+        )
 
-    async def _transfer_url(
-        self, request: httpx.Request, match: re.Match[str], body: dict[str, object]
-    ) -> httpx.Response:
-        sandbox = self._running(match)
-        if isinstance(sandbox, httpx.Response):
-            return sandbox
-        raw = body.get('path')
-        assert isinstance(raw, str)
+    def transfer_url(self, sandbox_id: str, raw: str, op: str) -> boat_sdk.FileUrlResponse:
+        sandbox = self._running(sandbox_id)
         path = Path(os.path.normpath(sandbox.home / raw))
         # Boat signs the URL without looking at the file.
         if not _under(path, sandbox.home, sandbox.tmp):
-            return boat_error(400, 'invalid_path', _ROOTS_MESSAGE)
-        op = 'write' if match['op'] == 'upload' else 'read'
+            raise boat_error(400, 'invalid_path', _ROOTS_MESSAGE)
         query = urlencode({'op': op, 'sandbox': sandbox.id, 'path': str(path), 'sig': 'fake-signature'})
-        method = 'PUT' if op == 'write' else 'GET'
-        return boat_ok(f'file.{match["op"]}_url', url=f'https://{MACHINE_HOST}/file-transfer?{query}', method=method)
+        return boat_sdk.FileUrlResponse.model_validate(
+            {
+                'ok': True,
+                'type': f'file.{"upload" if op == "write" else "download"}_url',
+                'url': f'https://{MACHINE_HOST}/file-transfer?{query}',
+                'method': 'PUT' if op == 'write' else 'GET',
+                'path': str(path),
+                'expiresAt': datetime.now(UTC).isoformat(),
+            }
+        )
 
-    async def _transfer(self, request: httpx.Request) -> httpx.Response:
-        # The URL is signed: Boat's API key must not travel to the sandbox's machine.
-        assert 'authorization' not in request.headers, 'the Boat API key was sent to a file-transfer URL'
-        query = parse_qs(urlsplit(str(request.url)).query)
+    def transfer(self, method: str, url: str, body: bytes) -> Answer:
+        parts = urlsplit(url)
+        assert parts.hostname == MACHINE_HOST, f'not a signed file-transfer URL: {url}'
+        query = parse_qs(parts.query)
         sandbox = self.sandboxes.get(query['sandbox'][0])
         if sandbox is None or sandbox.state not in ('ready', 'idle', 'running'):
-            raise httpx.ConnectError('the sandbox machine is not running', request=request)
+            # The URL points at the sandbox's machine, which stops answering once Boat stops it.
+            raise urllib3.exceptions.ProtocolError('Connection aborted.')
         path = Path(query['path'][0])
         if query['op'][0] == 'read':
+            assert method == 'GET'
             if not path.exists():
-                return httpx.Response(404, json={'error': 'not_found', 'message': 'File not found.'})
+                return Answer(404, json.dumps({'error': 'not_found', 'message': 'File not found.'}).encode())
             # A download follows the file API refusing the file as too large, so it is one.
-            return httpx.Response(200, content=path.read_bytes(), headers={'content-type': 'application/octet-stream'})
+            return Answer(200, path.read_bytes())
+        assert method == 'PUT'
         if path.exists() and not path.is_file():
-            return httpx.Response(
-                400, json={'error': 'not_a_file', 'message': 'Path exists and is not a regular file.'}
-            )
-        if (error := _write_file(path, request.content)) is not None:
-            return httpx.Response(400, json={'error': 'write_failed', 'message': error})
-        return httpx.Response(200, json={'success': True, 'path': str(path), 'size': len(request.content)})
+            message = 'Path exists and is not a regular file.'
+            return Answer(400, json.dumps({'error': 'not_a_file', 'message': message}).encode())
+        if (error := _write_file(path, body)) is not None:
+            return Answer(400, json.dumps({'error': 'write_failed', 'message': error}).encode())
+        return Answer(200, json.dumps({'success': True, 'path': str(path), 'size': len(body)}).encode())
 
 
 def _under(path: Path, *roots: Path) -> bool:
@@ -614,7 +799,7 @@ def _write_file(path: Path, data: bytes) -> str | None:
     return None
 
 
-def _run_sync(sandbox: FakeSandbox, command: str, timeout: int) -> httpx.Response:
+def _run_sync(sandbox: FakeSandbox, command: str, timeout: int) -> boat_sdk.Command200Response:
     """A synchronous command: Boat answers once its output closes or its timeout stops it."""
     process = subprocess.Popen(
         ['bash', '-c', command],
@@ -634,14 +819,10 @@ def _run_sync(sandbox: FakeSandbox, command: str, timeout: int) -> httpx.Respons
             os.killpg(process.pid, signal.SIGKILL)
         out, err = process.communicate()
     code = process.returncode
-    (stdout, stdout_cut), (stderr, stderr_cut) = _tail(out, _STREAM_LIMIT), _tail(err, _STREAM_LIMIT)
-    return boat_ok(
-        'command.finished',
-        success=code == 0,
-        exitCode=code if code >= 0 else 128 - code,
-        stdout=stdout,
-        stderr=stderr,
-        stdoutTruncated=stdout_cut,
-        stderrTruncated=stderr_cut,
-        timedOut=timed_out,
+    return finished(
+        exit_code=code if code >= 0 else 128 - code,
+        stdout=out[-_STREAM_LIMIT:].decode(errors='replace'),
+        stderr=err[-_STREAM_LIMIT:].decode(errors='replace'),
+        timed_out=timed_out,
+        truncated=len(out) > _STREAM_LIMIT,
     )

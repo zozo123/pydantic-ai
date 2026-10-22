@@ -27,14 +27,17 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any
 
 import anyio
-import httpx
+import anyio.to_thread
+import boat_sdk
 import pytest
+from boat_sdk.exceptions import BadRequestException, NotFoundException
 from pytest_examples import CodeExample
 
 from pydantic_ai import Agent, RunContext
@@ -76,16 +79,17 @@ def _unique(prefix: str) -> str:
 
 
 @pytest.fixture
-async def client() -> AsyncIterator[httpx.AsyncClient]:
-    """A caller-owned API client for one test's backends, configured as the docs say to configure `client=`."""
-    async with httpx.AsyncClient(
-        base_url='https://boat.dev/api/v1', headers={'Authorization': f'Bearer {os.environ["BOAT_API_KEY"]}'}
-    ) as client:
-        yield client
+def client() -> boat_sdk.BoatApi:
+    """A caller-owned SDK client for one test's backends, configured as the docs say to configure `client=`."""
+    return boat_sdk.BoatApi(boat_sdk.ApiClient(boat_sdk.Configuration(access_token=os.environ['BOAT_API_KEY'])))
+
+
+async def _sandbox(client: boat_sdk.BoatApi, sandbox_id: str) -> boat_sdk.Sandbox:
+    return (await anyio.to_thread.run_sync(partial(client.get, sandbox_id))).sandbox
 
 
 @asynccontextmanager
-async def _owned(client: httpx.AsyncClient, *, working_dir: str | None = None) -> AsyncGenerator[BoatSandboxBackend]:
+async def _owned(client: boat_sdk.BoatApi, *, working_dir: str | None = None) -> AsyncGenerator[BoatSandboxBackend]:
     """Create a sandbox and delete it on the way out, even when the test deleted it already."""
     backend = BoatSandboxBackend(client=client, machine_type='small', auto_stop=LIVE_AUTO_STOP, working_dir=working_dir)
     try:
@@ -95,15 +99,8 @@ async def _owned(client: httpx.AsyncClient, *, working_dir: str | None = None) -
         if backend.ref is not None:
             await BoatSandbox(client=client).destroy(backend.ref)
             # Boat forgets a deleted sandbox at once.
-            assert (await client.get(f'/sandboxes/{backend.ref.id}')).status_code == 404
-
-
-async def _state(client: httpx.AsyncClient, sandbox_id: str) -> str:
-    response = await client.get(f'/sandboxes/{sandbox_id}')
-    response.raise_for_status()
-    state = response.json()['sandbox']['state']
-    assert isinstance(state, str)
-    return state
+            with pytest.raises(NotFoundException):
+                await _sandbox(client, backend.ref.id)
 
 
 async def _assert_stopped(backend: BoatSandboxBackend, pid_file: str) -> None:
@@ -117,21 +114,19 @@ async def _assert_stopped(backend: BoatSandboxBackend, pid_file: str) -> None:
 
 
 async def test_an_operation_extends_the_auto_stop(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    client: boat_sdk.BoatApi, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Validates the fake-encoded assumptions that command activity does not move Boat's auto-stop
-    deadline, that `PATCH /sandboxes/{id}` with `ttlSeconds` sets it to that many seconds from now,
-    and that the key the live tier runs with may send it, so an active run keeps its sandbox up."""
+    deadline, that an update with `ttlSeconds` sets it to that many seconds from now, and that the
+    key the live tier runs with may send it, so an active run keeps its sandbox up."""
     async with _owned(client) as backend:
         assert backend.ref is not None
         sandbox_id = backend.ref.id
 
         async def deadline() -> datetime:
-            response = await client.get(f'/sandboxes/{sandbox_id}')
-            response.raise_for_status()
-            archive_after = response.json()['sandbox']['archiveAfter']
-            assert isinstance(archive_after, str)
-            return datetime.fromisoformat(archive_after)
+            archive_after = (await _sandbox(client, sandbox_id)).archive_after
+            assert archive_after is not None
+            return archive_after
 
         before = await deadline()
         await anyio.sleep(2)
@@ -150,7 +145,7 @@ async def test_an_operation_extends_the_auto_stop(
         assert abs((extended - requested - timedelta(seconds=LIVE_AUTO_STOP)).total_seconds()) < 10
 
 
-async def test_commands_get_a_usable_environment(client: httpx.AsyncClient) -> None:
+async def test_commands_get_a_usable_environment(client: boat_sdk.BoatApi) -> None:
     """Validates what the fake encodes and the docs say about a new sandbox: Ubuntu 24.04 with git,
     Python, Node.js, Docker and ripgrep; commands run as `user` in `/home/user` with passwordless
     `sudo`, Boat's `PATH`, and without the account's GitHub token (`noEnv`). A per-call `env` adds
@@ -187,35 +182,39 @@ async def test_commands_get_a_usable_environment(client: httpx.AsyncClient) -> N
         assert result.stdout == 'kept\n'
 
 
-async def test_large_output_is_exact(client: httpx.AsyncClient) -> None:
-    """Validates the fake-encoded assumption that a finished command's status, read again with a tail as large
-    as Boat keeps, is its exact output when the first check's short tail was cut."""
+async def test_large_output_is_exact(client: boat_sdk.BoatApi) -> None:
+    """Validates the fake-encoded assumption that following a detached command's output with the SDK's
+    `follow_command` yields all of it, in order, with nothing repeated across its chunks."""
     async with _owned(client) as backend:
         result = await backend.run(['seq', '1', '50000'], timeout=120)
 
         assert result.stdout == ''.join(f'{i}\n' for i in range(1, 50001))
 
 
-async def test_output_over_the_limit_raises_with_a_preview(client: httpx.AsyncClient) -> None:
-    """Validates the fake-encoded assumption that Boat keeps the last 8 MiB of each stream and flags a
-    longer one as truncated: output at the limit comes back whole, and output past it raises
-    `WorkspaceOutputLimitError` with the beginning of each stream read from offset 0."""
+async def test_output_over_the_limit_raises_with_a_preview(client: boat_sdk.BoatApi) -> None:
+    """Validates the fake-encoded assumption that Boat's output stream sends each stream's frames as the
+    command writes them: output at the 8 MiB limit comes back whole, and output past it stops the
+    command and raises `WorkspaceOutputLimitError` with the beginning of each stream."""
     fill = f'head -c {_OUTPUT_LIMIT} /dev/zero | tr "\\0" a'
+    pid_file = f'/tmp/{_unique("pids")}'
     async with _owned(client) as backend:
         result = await backend.run(fill, shell=True, timeout=120)
         assert (result.exit_code, len(result.stdout), set(result.stdout)) == (0, _OUTPUT_LIMIT, {'a'})
 
         with pytest.raises(WorkspaceOutputLimitError) as exc_info:
-            await backend.run(f'printf b; {fill}; printf e >&2', shell=True, timeout=120)
+            await backend.run(
+                f'echo "$$" > {pid_file}; printf e >&2; sleep 1; printf b; {fill}; sleep 600', shell=True, timeout=120
+            )
         error = exc_info.value
         assert error.limit == _OUTPUT_LIMIT
         assert error.stdout == 'b' + 'a' * (64 * 1024 - 1)
         assert error.stderr == 'e'
+        await _assert_stopped(backend, pid_file)
 
 
-async def test_timeout_raises_with_the_partial_output_and_stops_the_command(client: httpx.AsyncClient) -> None:
-    """Validates the fake-encoded assumptions that a running command's status carries the tail of what
-    it printed so far, and that `DELETE /commands/{pid}` ends its process tree, background children
+async def test_timeout_raises_with_the_partial_output_and_stops_the_command(client: boat_sdk.BoatApi) -> None:
+    """Validates the fake-encoded assumptions that a running command's output stream carries what it
+    printed so far, and that the SDK's `stop_command` ends its process tree, background children
     included, while the sandbox keeps running for the next command."""
     pid_file = f'/tmp/{_unique("pids")}'
     async with _owned(client) as backend:
@@ -229,7 +228,7 @@ async def test_timeout_raises_with_the_partial_output_and_stops_the_command(clie
         await _assert_stopped(backend, pid_file)
 
 
-async def test_a_cancelled_run_stops_the_command(client: httpx.AsyncClient) -> None:
+async def test_a_cancelled_run_stops_the_command(client: boat_sdk.BoatApi) -> None:
     """Validates the protocol's cancellation contract against real Boat, and the docs claim that a
     stopped command's whole process tree ends: a cancelled `run()` stops the command, a child that
     left for a session of its own included."""
@@ -241,7 +240,7 @@ async def test_a_cancelled_run_stops_the_command(client: httpx.AsyncClient) -> N
         await _assert_stopped(backend, pid_file)
 
 
-async def test_a_new_sandbox_gets_its_working_dir(client: httpx.AsyncClient) -> None:
+async def test_a_new_sandbox_gets_its_working_dir(client: boat_sdk.BoatApi) -> None:
     """Validates the fake-encoded assumption that `mkdir -p` through a synchronous command makes
     `working_dir` on a new sandbox as `user`, so the first command starts there, and the docs claim
     that on an attached sandbox a missing `working_dir` fails with `WorkspaceError`."""
@@ -256,24 +255,25 @@ async def test_a_new_sandbox_gets_its_working_dir(client: httpx.AsyncClient) -> 
             await attached.run(['true'], timeout=60)
 
 
-async def test_files_over_the_inline_limit_round_trip(client: httpx.AsyncClient) -> None:
+async def test_files_over_the_inline_limit_round_trip(client: boat_sdk.BoatApi) -> None:
     """Validates the fake-encoded assumptions that Boat's file API refuses a file over 5 MiB with
-    `File is too large`, and that its signed upload and download URLs, sent without the API key,
-    move such a file whole and create its missing parents."""
+    `File is too large`, and that its signed upload and download URLs, sent through the SDK client's
+    connection pool without the API key, move such a file whole and create its missing parents."""
     data = os.urandom(_INLINE_FILE_LIMIT + 1)
     path = f'/home/user/{_unique("big")}/big.bin'
     async with _owned(client) as backend:
         assert backend.ref is not None
         await backend.write_bytes(path, data)
 
-        refused = await client.get(f'/sandboxes/{backend.ref.id}/files', params={'path': path, 'encoding': 'base64'})
-        assert refused.status_code == 400 and refused.json()['message'].startswith('File is too large')
+        with pytest.raises(BadRequestException) as refused:
+            await anyio.to_thread.run_sync(partial(client.read_file, backend.ref.id, path, encoding='base64'))
+        assert 'File is too large' in str(vars(refused.value)['body'])
         assert await backend.read_bytes(path) == data
         result = await backend.run(['sha256sum', path], timeout=60)
         assert result.stdout.split()[0] == hashlib.sha256(data).hexdigest()
 
 
-async def test_paths_outside_the_file_api_roots_round_trip(client: httpx.AsyncClient) -> None:
+async def test_paths_outside_the_file_api_roots_round_trip(client: boat_sdk.BoatApi) -> None:
     """Validates the fake-encoded assumption that Boat's file API refuses a path that resolves outside
     `/home/user` and `/tmp`, by its name (`invalid_path`) or through a symlink (`sandbox_direct_failed`),
     so those reads and writes go through shell commands run as `user` and fail with the built-in errors."""
@@ -298,7 +298,7 @@ async def test_paths_outside_the_file_api_roots_round_trip(client: httpx.AsyncCl
 
 
 async def test_a_sandbox_stopped_under_a_live_backend_is_unavailable_until_attached_again(
-    client: httpx.AsyncClient,
+    client: boat_sdk.BoatApi,
 ) -> None:
     """Validates the fake-encoded assumptions about Boat's stop: once the sandbox is archived, commands
     and file calls answer `409 machine_not_running`, which ends the run as `WorkspaceUnavailableError`,
@@ -308,9 +308,9 @@ async def test_a_sandbox_stopped_under_a_live_backend_is_unavailable_until_attac
         await backend.write_bytes(path, b'kept')
         assert backend.ref is not None
         sandbox_id = backend.ref.id
-        assert (await client.post(f'/sandboxes/{sandbox_id}/stop')).status_code == 202
+        await anyio.to_thread.run_sync(partial(client.stop, sandbox_id))
         with anyio.fail_after(60):
-            while await _state(client, sandbox_id) != 'archived':
+            while (await _sandbox(client, sandbox_id)).state != 'archived':
                 await anyio.sleep(0.5)
 
         with pytest.raises(WorkspaceUnavailableError, match='was stopped'):
@@ -323,11 +323,11 @@ async def test_a_sandbox_stopped_under_a_live_backend_is_unavailable_until_attac
         assert (await attached.run(['cat', path], timeout=30)).stdout == 'kept'
 
 
-async def test_a_deleted_sandbox_is_unavailable_and_destroying_it_again_is_quiet(client: httpx.AsyncClient) -> None:
-    """Validates the fake-encoded assumptions about deletion: right after `DELETE`, Boat answers
+async def test_a_deleted_sandbox_is_unavailable_and_destroying_it_again_is_quiet(client: boat_sdk.BoatApi) -> None:
+    """Validates the fake-encoded assumptions about deletion: right after it, Boat answers
     `404 not_found` on every call for the sandbox, which a held backend reports as
     `WorkspaceUnavailableError` rather than a missing file, an attach reports the same way, and
-    destroying it again returns quietly, with a caller's client or one opened from `BOAT_API_KEY`."""
+    destroying it again returns quietly, with a caller's client or one built from `BOAT_API_KEY`."""
     path = f'/home/user/{_unique("deleted")}.txt'
     async with _owned(client) as backend:
         await backend.write_bytes(path, b'before-delete')
@@ -345,7 +345,7 @@ async def test_a_deleted_sandbox_is_unavailable_and_destroying_it_again_is_quiet
         await BoatSandbox().destroy(ref)
 
 
-async def test_coder_tools_run_in_the_sandbox(client: httpx.AsyncClient) -> None:
+async def test_coder_tools_run_in_the_sandbox(client: boat_sdk.BoatApi) -> None:
     """Validates the fake-encoded assumption that a relative path the file API writes is where a
     command started in the working directory finds it, so `Coder`'s tools agree."""
     async with _owned(client) as backend:

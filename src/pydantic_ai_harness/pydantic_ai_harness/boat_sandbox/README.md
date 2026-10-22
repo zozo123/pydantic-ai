@@ -11,16 +11,16 @@ Run your agent's commands and file edits in an isolated [Boat](https://boat.dev)
 uv:
 
 ```bash
-uv add "pydantic-ai-harness[anthropic]"
+uv add "pydantic-ai-harness[boat,anthropic]"
 ```
 
 pip:
 
 ```bash
-pip install "pydantic-ai-harness[anthropic]"
+pip install "pydantic-ai-harness[boat,anthropic]"
 ```
 
-No extra is needed for Boat itself: the capability talks to Boat's REST API with `httpx`, which the harness already depends on. The `anthropic` extra is there because the examples use an Anthropic model; swap it for your model provider's extra. Then set `BOAT_API_KEY` to a [Boat API key](https://docs.boat.dev/api-keys), and `ANTHROPIC_API_KEY` for the examples. A key created with Boat's `ci` preset is enough for the sandboxes it creates: it can create, resume, use, and delete them. Boat added resume and delete to `ci` later, so an older `ci` key cannot resume or delete; create a new one ([Boat's scopes](https://docs.boat.dev/api-keys/scopes#presets)).
+The `boat` extra installs Boat's Python SDK, [`boat-sdk`](https://pypi.org/project/boat-sdk/), which the capability runs on. The `anthropic` extra is there because the examples use an Anthropic model; swap it for your model provider's extra. Then set `BOAT_API_KEY` to a [Boat API key](https://docs.boat.dev/api-keys), and `ANTHROPIC_API_KEY` for the examples. A key created with Boat's `ci` preset is enough for the sandboxes it creates: it can create, resume, use, and delete them. Boat added resume and delete to `ci` later, so an older `ci` key cannot resume or delete; create a new one ([Boat's scopes](https://docs.boat.dev/api-keys/scopes#presets)).
 
 ## Quick start
 
@@ -79,13 +79,13 @@ async def run_python(ctx: RunContext, code: str) -> str:
     return result.stdout + result.stderr
 ```
 
-Commands run under `sh -c` as `user`. File reads and writes under `/home/user` and `/tmp` go through Boat's file API; other paths go through shell commands run as `user`. Boat's file API reads as root, so a read can return a file that `user`'s commands cannot open; writes run as `user`. File reads and writes refuse FIFOs with `OSError`: a read at once, and a write after about a minute, once it has timed out twice, since Boat's file API waits for a reader before it answers a write. File writes create missing parent directories, write through a symlink to its target, and keep an existing file's mode.
+Commands run under `sh -c` as `user`. File reads and writes under `/home/user` and `/tmp` go through Boat's file API; other paths go through shell commands run as `user`. Boat's file API reads as root, so a read can return a file that `user`'s commands cannot open; writes run as `user`. File reads and writes refuse FIFOs with `OSError`: a read at once, and a write after about two minutes, once Boat's SDK has given up sending it again, since Boat's file API waits for a reader before it answers a write. File writes create missing parent directories, write through a symlink to its target, and keep an existing file's mode.
 
 ### What a timeout stops
 
-A command timeout starts after the sandbox is ready. Each command runs as a detached Boat command, so Boat's 600-second limit on commands that wait for their result does not apply. A timeout or a cancelled run stops the command through Boat's process API, which ends its whole process tree, background children included, and the sandbox keeps running for other commands. `WorkspaceTimeoutError` carries the last 4 KiB of each stream's output so far. If Boat does not confirm the stop within 15 seconds, the command may still be running: inspect the sandbox or delete it yourself. `timeout=None` removes the command deadline; the checks on a running command extend Boat's auto-stop (see [Clean up](#clean-up)), and a sandbox stopped during a command in another way, for example with `boat stop`, makes `run()` raise `WorkspaceUnavailableError`. Boat limits API requests to 1,000 per minute from one IP address, and the checks on a running command count toward that limit: they start 0.2 seconds apart and back off to one every 2 seconds. A check that fails on a network error or a Boat server error (HTTP 500, 502, 503, or 504) is sent again for up to a minute, waiting as long as a 503 answer asks; if it still fails, `run()` stops the command and raises `WorkspaceError`.
+A command timeout starts after the sandbox is ready. Each command runs as a detached Boat command, so Boat's 600-second limit on commands that wait for their result does not apply, and `run()` follows its output over one streaming connection with the SDK's `follow_command`, which reconnects after a network failure for up to a minute. A timeout or a cancelled run stops the command with the SDK's `stop_command`, which ends its whole process tree, background children included, and the sandbox keeps running for other commands. `WorkspaceTimeoutError` carries the last 4 KiB of each stream's output so far. If Boat does not confirm the stop within 15 seconds, the command may still be running: inspect the sandbox or delete it yourself. `timeout=None` removes the command deadline; while a command runs, the backend keeps extending Boat's auto-stop (see [Clean up](#clean-up)), and a sandbox stopped during a command in another way, for example with `boat stop`, makes `run()` raise `WorkspaceUnavailableError`. If the output stream fails for good, or Boat loses track of the command, `run()` stops the command and raises `WorkspaceError`.
 
-`run()` returns when the command exits, even if a background child it started is still running; output that child writes afterwards is not returned. A command whose stdout or stderr passes 8 MiB, Boat's limit per stream, raises `WorkspaceOutputLimitError` once it exits, with the first 64 KiB of each stream in `stdout` and `stderr`. Redirect large or background output to a file instead; `Shell.start_command` manages its own output log.
+`run()` returns when the command exits, even if a background child it started is still running; output that child writes afterwards is not returned. A command whose stdout or stderr passes 8 MiB is stopped and raises `WorkspaceOutputLimitError`, with the first 64 KiB of each stream in `stdout` and `stderr`. Redirect large or background output to a file instead; `Shell.start_command` manages its own output log.
 
 See [Workspaces](https://pydantic.dev/docs/ai/core-concepts/workspace/) for more.
 
@@ -112,7 +112,7 @@ The ref holds no credentials, so the process that reattaches needs `BOAT_API_KEY
 
 Already have a Boat sandbox, such as one from `boat new`? Pass `workspace=WorkspaceRef(provider='boat', id='bx_...')` to a run, with `WorkspaceRef` from `pydantic_ai.workspaces`. The sandbox keeps the settings it was created with: unless it was created with `noEnv`, its commands can read your account's credentials. A `ci` key cannot resume or delete a sandbox it did not create.
 
-A run leaves a backend you built open. Call `await backend.aclose()` when you are done with it: that closes the client it opened from `BOAT_API_KEY`, not the sandbox, and a later operation opens a new one. A `client=` you passed is never closed.
+A backend you build holds no connection of its own: the SDK client it uses, one per API key, is shared by the whole process, so there is nothing to close when you are done with it.
 
 ## Prepare a sandbox before the run
 
@@ -134,19 +134,18 @@ async def run_in_prepared_sandbox() -> str:
         result = await agent.run('Do the task in TASK.md.', workspace=backend)
         return result.output
     finally:
-        await backend.aclose()
         ref = backend.ref  # set once the sandbox exists
         if ref is not None:
             await BoatSandbox().destroy(ref)
 ```
 
-The run uses the backend as it is, so `BoatSandbox`'s settings don't apply to it, and leaves it open: close it with `aclose()`. To keep the sandbox instead, store `backend.ref` and pass it as `workspace=` to reattach later.
+The run uses the backend as it is, so `BoatSandbox`'s settings don't apply to it. To keep the sandbox instead, store `backend.ref` and pass it as `workspace=` to reattach later.
 
 To start every sandbox with your project's dependencies installed, set them up once in a sandbox, save it as a [named snapshot](https://docs.boat.dev/snapshots/templates) with `boat snapshot <id> <name>`, and pass `BoatSandbox(snapshot='<name>')`: each new sandbox starts from that disk. A named snapshot does not expire, and it keeps every file on its disk, so save it from a sandbox that holds nothing you would not give the agent. A snapshot Boat doesn't know fails on first use with `WorkspaceUnavailableError`.
 
 ## Clean up
 
-Pydantic AI never stops or deletes the sandbox. Boat stops it once `auto_stop` seconds pass without the backend extending it: one hour by default, or never with `auto_stop=0`. Boat counts that time from creation or resume and commands do not move it, so a command or file operation, or a check on a running command, sets the deadline to a full `auto_stop` from then, at most once a minute, or once per half of `auto_stop` when that is under two minutes. A run that works in the sandbox more often than `auto_stop` minus that interval keeps it up, and an idle one stops at most `auto_stop` seconds after its last operation; a later run that attaches resumes it. A failed extension is logged as a warning and tried again once the interval has passed; when Boat refuses it for the key (HTTP 402 or 403), such as a key without `sandbox.update`, the backend stops asking. A stopped sandbox costs nothing and keeps its disk for 14 days; after that Boat deletes the disk and the sandbox can no longer be resumed. Delete it with the ref you stored:
+Pydantic AI never stops or deletes the sandbox. Boat stops it once `auto_stop` seconds pass without the backend extending it: one hour by default, or never with `auto_stop=0`. Boat counts that time from creation or resume and commands do not move it, so a command or file operation sets the deadline to a full `auto_stop` from then, and a running command keeps setting it while it runs, at most once a minute, or once per half of `auto_stop` when that is under two minutes. A run that works in the sandbox more often than `auto_stop` minus that interval keeps it up, and an idle one stops at most `auto_stop` seconds after its last operation; a later run that attaches resumes it. A failed extension is logged as a warning and tried again once the interval has passed; when Boat refuses it for the key (HTTP 402 or 403), such as a key without `sandbox.update`, the backend stops asking. A stopped sandbox costs nothing and keeps its disk for 14 days; after that Boat deletes the disk and the sandbox can no longer be resumed. Delete it with the ref you stored:
 
 ```python {names="defined"}
 from pydantic_ai.workspaces import WorkspaceRef
@@ -189,18 +188,18 @@ A run that ends before its ref is stored, such as a crash, Ctrl-C, or a killed w
 
 | Option | What it does |
 | --- | --- |
-| `client` | An `httpx.AsyncClient` to share across runs on one event loop, or to route through a proxy. Give it `base_url='https://boat.dev/api/v1'` and an `Authorization: Bearer <key>` header. Default: `None`, a client each run opens from `BOAT_API_KEY` and closes when it ends. You close a client you pass; `BoatSandbox` never does. |
+| `client` | A `boat_sdk.BoatApi` to use instead of one built from `BOAT_API_KEY`, for example one whose `boat_sdk.Configuration` routes through a proxy. Default: `None`, a client built from `BOAT_API_KEY` on first use and shared by every run in the process with that key. The SDK holds no event loop state, so one client serves every run, and nothing needs closing. |
 | `machine_type` | Size of a new sandbox: `'small'`, `'default'`, `'large'`, or `'xlarge'`. See [Boat's sizes](https://docs.boat.dev/machines). Default: `None`, Boat's `default` size, or the snapshot's size when `snapshot` is set. A size your plan doesn't allow fails on first use. |
 | `snapshot` | Named snapshot a new sandbox starts from. Default: `None`, Boat's base image. An unknown snapshot fails on first use. |
 | `auto_stop` | Seconds a new sandbox runs without the backend extending it before Boat stops it, keeping its disk. Operations extend it at most once a minute (once per half of it when it is under two minutes), so a run that works in the sandbox more often than `auto_stop` minus that interval keeps it up, and an idle one stops; see [Clean up](#clean-up). `0` disables it; on Boat's free trial, `0` or a value over 7200 fails on first use. Default: `None`, Boat's default of 1 hour. |
 | `working_dir` | Absolute directory commands start in and relative paths resolve against. Default: `None`, the sandbox's own (`/home/user`, where commands run as `user`); set a project directory, or use relative paths for portable code. Created on a new sandbox; on an attached sandbox it must already exist. |
 | `env` | Environment variables every command gets. Default: `None`. Nothing from your machine's environment reaches the sandbox. Values travel in each command's command line, so the sandbox's process list and Boat's command history show them. |
 
-Boat runs on the asyncio event loop only: the backend finishes sandbox creation and command cleanup on asyncio tasks of its own, so under Trio it raises `UserError`.
+Boat's Python SDK is synchronous: the backend calls it in worker threads, so it works on asyncio and Trio.
 
 ## Durable execution
 
-Each activity opens its own Boat client and closes it once its operation ends, so the worker has nothing to close. Run a Temporal dev server on `localhost:7233` first.
+Activities share the process's Boat SDK client, which holds no event loop state, so the worker has nothing to close. Run a Temporal dev server on `localhost:7233` first.
 
 ```python
 import asyncio
@@ -248,7 +247,7 @@ if __name__ == '__main__':
 
 `Coder`, `Shell`, and `FileSystem` work under DBOS, Temporal and Prefect. See the [Coder](https://pydantic.dev/docs/ai/harness/coder/#durable-execution), [Shell](https://pydantic.dev/docs/ai/harness/shell/#durable-execution), and [FileSystem](https://pydantic.dev/docs/ai/harness/filesystem/#durable-execution) guides for engine-specific limits.
 
-Creating a sandbox sends Boat an `Idempotency-Key`, so when a reply is lost the backend asks again without creating a second sandbox. The key lasts as long as the backend, and Temporal builds a new backend for each activity, so a retried activity that creates the sandbox can leave the first one behind; the `Created Boat sandbox <id>` log line finds it. A command is sent again only when Boat reports that it did not start, or when the request could not reach Boat. When a reply about a command is lost, `run()` raises `WorkspaceError`, which durable engines record rather than retry, since the command may have run. Outside a `run()` command's start and checks, failures a retry may fix (Boat's request limits, HTTP 429; its server errors, HTTP 5xx; and answers that are not Boat's JSON envelope with a 2xx or 5xx status) raise `BoatAPIError` from `pydantic_ai_harness.boat_sandbox`, and so does a command start Boat refuses with HTTP 429. It carries the HTTP `status`, Boat's `code` and `message`, and the `retry_after` wait Boat asks for, and durable engines retry it.
+Creating a sandbox sends Boat an idempotency key, so when a reply is lost the backend asks again without creating a second sandbox. The key lasts as long as the backend, and Temporal builds a new backend for each activity, so a retried activity that creates the sandbox can leave the first one behind; the `Created Boat sandbox <id>` log line finds it. A command start is sent again only when it could not reach Boat. When a reply about a command is lost, `run()` raises `WorkspaceError`, which durable engines record rather than retry, since the command may have run. Failures a retry may fix raise the SDK's own errors, and durable engines retry them: Boat's request limits (HTTP 429) and server errors (HTTP 5xx) raise `boat_sdk.ApiException`, with the HTTP `status` and Boat's JSON answer in `body`, and network failures raise `urllib3`'s errors. So does a command start Boat refuses with HTTP 429, or one that could not reach Boat.
 
 Removing a capability while workflows using it are still running changes their replay history. Drain those workflows or use [Temporal worker versioning](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning) before deploying the change.
 
@@ -261,5 +260,3 @@ Removing a capability while workflows using it are still running changes their r
 ::: pydantic_ai_harness.boat_sandbox.BoatSandbox
 
 ::: pydantic_ai_harness.boat_sandbox.BoatSandboxBackend
-
-::: pydantic_ai_harness.boat_sandbox.BoatAPIError

@@ -1,6 +1,6 @@
 """Pydantic AI's workspace backend conformance suite, run against `BoatSandboxBackend`.
 
-`TestFakeBoatSandboxBackend` runs everywhere, over the fake Boat API, whose sandboxes run real
+`TestFakeBoatSandboxBackend` runs everywhere, over the fake Boat SDK, whose sandboxes run real
 commands and file operations in temporary host directories. `TestLiveBoatSandboxBackend` runs the
 same rules against a real sandbox and is gated by the `boat_live` marker.
 """
@@ -30,7 +30,7 @@ async def _delete(backend: WorkspaceBackend) -> None:
 
 # The live tier runs without coverage.
 async def _delete_if_live(sandbox_id: str) -> None:  # pragma: no cover
-    # Quiet when the destroy rule already deleted it, and closes the client it opens.
+    # Quiet when the destroy rule already deleted it.
     await BoatSandbox().destroy(WorkspaceRef(provider='boat', id=sandbox_id))
 
 
@@ -67,8 +67,7 @@ class TestLiveBoatSandboxBackend(WorkspaceBackendSuite):  # pragma: lax no cover
         return False
 
     # Destructive rules need their own sandbox, not the shared class-scoped one. Each is deleted
-    # here if a failed rule left it behind, and the client it opened is closed rather than left to
-    # the garbage collector with a connection still open.
+    # here if a failed rule left it behind.
     @pytest.fixture
     async def destructive_backend(self) -> AsyncIterator[Callable[[], WorkspaceBackend]]:
         created: list[BoatSandboxBackend] = []
@@ -80,11 +79,8 @@ class TestLiveBoatSandboxBackend(WorkspaceBackendSuite):  # pragma: lax no cover
 
         yield create
         for backend in created:
-            try:
-                if backend.ref is not None:
-                    await _delete_if_live(backend.ref.id)
-            finally:
-                await backend.aclose()
+            if backend.ref is not None:
+                await _delete_if_live(backend.ref.id)
 
     # Class-scoped so the rules share one sandbox instead of starting one each; the suite runs
     # its destroy rule last.
@@ -96,26 +92,12 @@ class TestLiveBoatSandboxBackend(WorkspaceBackendSuite):  # pragma: lax no cover
             await backend.working_dir()
             yield backend
         finally:
-            try:
-                if backend.ref is not None:
-                    await _delete_if_live(backend.ref.id)
-            finally:
-                await backend.aclose()
+            if backend.ref is not None:
+                await _delete_if_live(backend.ref.id)
 
-    # The suite drops the backend it attaches; each one opened its own API client, which is closed
-    # here rather than left to the garbage collector with a connection still open.
     @pytest.fixture
-    async def attach_backend(self) -> AsyncIterator[Callable[[WorkspaceRef], WorkspaceBackend]]:
-        attached: list[BoatSandboxBackend] = []
-
-        def attach(ref: WorkspaceRef) -> WorkspaceBackend:
-            backend = BoatSandboxBackend(ref=ref)
-            attached.append(backend)
-            return backend
-
-        yield attach
-        for backend in attached:
-            await backend.aclose()
+    def attach_backend(self) -> Callable[[WorkspaceRef], WorkspaceBackend]:
+        return _attach
 
     @pytest.fixture
     def destroy_environment(self) -> Callable[[WorkspaceBackend], Awaitable[None]]:
