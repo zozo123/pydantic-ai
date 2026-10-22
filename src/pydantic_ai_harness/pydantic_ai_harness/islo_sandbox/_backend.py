@@ -24,8 +24,11 @@ live API. The `islo_live` tier (`tests/harness/islo_sandbox/`) exercises each on
   backend sends absolute paths and checks a path's type before reading it).
 - A paused sandbox refuses commands (`409 SANDBOX_INVALID_STATE`) and file calls (`503
   RESOURCE_UNAVAILABLE`); resuming it, also on activity, needs account credit (not exercised).
-- Deleting a running sandbox is immediate: its calls answer `404 SANDBOX_NOT_FOUND` from then on. A
-  paused sandbox takes some seconds to go.
+- After a delete, `get_sandbox_by_id` reports the sandbox `deleted` at once, while its own calls can
+  still succeed for some seconds before they answer `404 SANDBOX_NOT_FOUND`.
+- A create Islo refuses for lack of credit (`402 BILLING_NOT_ALLOWED`) can still make the sandbox,
+  answering up to 20 seconds later, and a delete sent soon after can leave it running (seen while
+  running the live tier, not exercised by it).
 """
 
 from __future__ import annotations

@@ -31,6 +31,7 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 
+import anyio
 import httpx
 import islo
 import pytest
@@ -125,8 +126,10 @@ async def test_creates_a_sandbox_with_its_settings_and_runs_a_command(client: is
 
 
 async def test_reattach_to_a_deleted_sandbox_is_unavailable(client: islo.AsyncIslo) -> None:
-    """Validates the fake-encoded assumption that a deleted sandbox answers `404 SANDBOX_NOT_FOUND`, to a
-    new attach and to calls on the held backend alike, rather than a missing file or a retryable error."""
+    """Validates the fake-encoded assumptions that `get_sandbox_by_id` reports a deleted sandbox `deleted`
+    at once, so a new attach is unavailable, and that the held backend's calls answer `404
+    SANDBOX_NOT_FOUND` once Islo has removed the sandbox, rather than a missing file or a retryable
+    error. Observed on 2026-10-22: those calls can still succeed for some seconds after the delete."""
     path = f'/tmp/{_unique("deleted")}.txt'
     async with _owned(client) as owner:
         await owner.write_bytes(path, b'before-delete')
@@ -135,8 +138,13 @@ async def test_reattach_to_a_deleted_sandbox_is_unavailable(client: islo.AsyncIs
 
         with pytest.raises(WorkspaceUnavailableError):
             await IsloSandboxBackend(client=client, ref=owner.ref).working_dir()
-        with pytest.raises(WorkspaceUnavailableError):
-            await owner.read_bytes(path)
+        with anyio.fail_after(60):
+            while True:
+                try:
+                    await owner.read_bytes(path)
+                except WorkspaceUnavailableError:
+                    break
+                await anyio.sleep(1)
         with pytest.raises(WorkspaceUnavailableError):
             await owner.run(['true'], timeout=30)
 
