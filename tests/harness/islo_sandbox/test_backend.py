@@ -154,6 +154,30 @@ class TestCreation:
         assert backend.ref is None and not fake_islo.sandboxes
         assert 'which a refused create left behind' in caplog.text
 
+    async def test_a_refused_create_whose_sandbox_cannot_be_deleted_yet_is_deleted_again(
+        self, fake_islo: FakeIslo, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake_islo.late_errors['create_sandbox'] = [billing('create')]
+        fake_islo.errors['delete_sandbox'] = [invalid_state()]
+        with caplog.at_level(logging.INFO, logger=_BACKEND):
+            with pytest.raises(WorkspaceUnavailableError):
+                await IsloSandboxBackend().working_dir()
+        assert not fake_islo.sandboxes
+        assert fake_islo.methods().count('delete_sandbox') == 2
+
+    async def test_a_refused_create_whose_sandbox_cannot_be_deleted_is_logged(
+        self, fake_islo: FakeIslo, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(f'{_BACKEND}._DISCARD_TIMEOUT', 0.2)
+        monkeypatch.setattr(f'{_BACKEND}._RETRY_DELAY', 0.05)
+        fake_islo.late_errors['create_sandbox'] = [billing('create')]
+        fake_islo.errors['delete_sandbox'] = [invalid_state()] * 100
+        with caplog.at_level(logging.WARNING, logger=_BACKEND):
+            with pytest.raises(WorkspaceUnavailableError):
+                await IsloSandboxBackend().working_dir()
+        assert 'Could not delete Islo sandbox pydantic-ai-' in caplog.text
+        assert len(fake_islo.sandboxes) == 1
+
     async def test_an_unknown_image_is_unavailable(self, fake_islo: FakeIslo, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger=_BACKEND):
             with pytest.raises(WorkspaceUnavailableError, match=r'^Could not start Islo sandbox: unknown image: nope$'):

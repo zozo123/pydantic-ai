@@ -28,7 +28,7 @@ if TYPE_CHECKING or _HAS_ISLO:  # pragma: no branch - the SDK-installed and slim
     from islo.core.api_error import ApiError
 
     from pydantic_ai.workspaces import WorkspaceRef
-    from pydantic_ai_harness.islo_sandbox import IsloSandbox
+    from pydantic_ai_harness.islo_sandbox import IsloSandbox, IsloSandboxBackend
 
     from .fake_islo import FakeIslo
 
@@ -72,6 +72,39 @@ async def destroy_and_confirm(ref: WorkspaceRef, client: islo.AsyncIslo | None =
                             return
                         raise
                     await anyio.sleep(1)
+
+
+class SharedSandbox:  # pragma: no cover - the live tier runs without coverage
+    """A small sandbox live tests share until it has run for `_SHARED_FOR` seconds, then a fresh one.
+
+    Islo pauses the sandboxes of an organization without credit within about a minute of starting
+    them (see `test_islo_live.py`), which a sandbox shared for longer would not survive, while one
+    per test would start dozens.
+    """
+
+    _SHARED_FOR = 15
+
+    def __init__(self) -> None:
+        self._backend: IsloSandboxBackend | None = None
+        self._started = 0.0
+
+    async def get(self) -> IsloSandboxBackend:
+        if self._backend is not None and anyio.current_time() - self._started > self._SHARED_FOR:
+            await self.close()
+        if self._backend is None:
+            self._backend = IsloSandboxBackend(pause_after_idle=LIVE_PAUSE_AFTER_IDLE, vcpus=1, memory_mb=1024)
+            await self._backend.working_dir()
+            self._started = anyio.current_time()
+        return self._backend
+
+    async def close(self) -> None:
+        backend, self._backend = self._backend, None
+        if backend is not None:
+            try:
+                if backend.ref is not None:
+                    await destroy_and_confirm(backend.ref)
+            finally:
+                await backend.aclose()
 
 
 class _PoisonedIslo(types.ModuleType):

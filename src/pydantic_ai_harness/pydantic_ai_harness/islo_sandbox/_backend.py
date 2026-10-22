@@ -100,6 +100,8 @@ _REQUEST_TIMEOUT = 30
 # Bound sandbox creation and attachment so a wedged control plane cannot hang acquisition.
 _CREATE_TIMEOUT = 120
 _TEARDOWN_TIMEOUT = 30.0
+# How long the backend keeps deleting a sandbox that a create Islo refused left behind.
+_DISCARD_TIMEOUT = 60.0
 # Internal commands (`pwd -P`, the shell file operations, a stop) get this long before the backend stops waiting.
 _HELPER_TIMEOUT = 60
 # Between attempts to create a sandbox whose earlier request may have been lost.
@@ -203,13 +205,21 @@ async def _find(client: AsyncIslo, name: str) -> SandboxResponse | None:
 
 
 async def _discard(client: AsyncIslo, name: str) -> None:
-    """Delete the sandbox named `name` if there is one; best effort, bounded and shielded."""
-    with anyio.move_on_after(_REQUEST_TIMEOUT, shield=True):
-        try:
-            await client.sandboxes.delete_sandbox(name, request_options=_ONCE)
-        except Exception:
-            return
-        logger.info('Deleted Islo sandbox %s, which a refused create left behind', name)
+    """Delete the sandbox named `name` if there is one; best effort, bounded and shielded.
+
+    Islo can still be making the sandbox when it refuses the create, and then refuse to delete it,
+    so the delete is sent again until a lookup no longer finds the sandbox.
+    """
+    with anyio.move_on_after(_DISCARD_TIMEOUT, shield=True) as deadline:
+        while await _find(client, name) is not None:
+            try:
+                await client.sandboxes.delete_sandbox(name, request_options=_ONCE)
+            except Exception:
+                await anyio.sleep(_RETRY_DELAY)
+            else:
+                logger.info('Deleted Islo sandbox %s, which a refused create left behind', name)
+    if deadline.cancelled_caught:
+        logger.warning('Could not delete Islo sandbox %s, which a refused create left behind', name)
 
 
 async def destroy_sandbox(client: AsyncIslo | None, sandbox_id: str) -> None:

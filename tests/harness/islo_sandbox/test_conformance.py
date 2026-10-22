@@ -9,14 +9,13 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 
-import anyio
 import pytest
 
 from pydantic_ai.workspaces import WorkspaceBackend, WorkspaceRef
 from pydantic_ai.workspaces.conformance import WorkspaceBackendSuite
 from pydantic_ai_harness.islo_sandbox import IsloSandbox, IsloSandboxBackend
 
-from .conftest import LIVE_PAUSE_AFTER_IDLE, destroy_and_confirm
+from .conftest import LIVE_PAUSE_AFTER_IDLE, SharedSandbox, destroy_and_confirm
 from .fake_islo import FakeIslo
 
 
@@ -53,59 +52,26 @@ class TestFakeIsloSandboxBackend(WorkspaceBackendSuite):
         return False
 
 
-class _SharedSandbox:  # pragma: no cover - the live tier runs without coverage
-    """A sandbox the live rules share until it has run for `_SHARED_FOR` seconds, then a fresh one.
-
-    Islo pauses the sandboxes of an organization without credit within about a minute of starting
-    them (see `test_islo_live.py`), which a class-long sandbox would not survive, while a sandbox per
-    rule would start some 30 of them.
-    """
-
-    _SHARED_FOR = 15
-
-    def __init__(self) -> None:
-        self._backend: IsloSandboxBackend | None = None
-        self._started = 0.0
-
-    async def get(self) -> IsloSandboxBackend:
-        if self._backend is not None and anyio.current_time() - self._started > self._SHARED_FOR:
-            await self.close()
-        if self._backend is None:
-            self._backend = IsloSandboxBackend(pause_after_idle=LIVE_PAUSE_AFTER_IDLE)
-            await self._backend.working_dir()
-            self._started = anyio.current_time()
-        return self._backend
-
-    async def close(self) -> None:
-        backend, self._backend = self._backend, None
-        if backend is not None:
-            try:
-                if backend.ref is not None:
-                    await destroy_and_confirm(backend.ref)
-            finally:
-                await backend.aclose()
-
-
 @pytest.mark.islo_live
 # The live tier runs without coverage; in CI only its gate fixtures run, to skip it.
 class TestLiveIsloSandboxBackend(WorkspaceBackendSuite):  # pragma: lax no cover
     @pytest.fixture(scope='class')
     @classmethod
-    async def shared(cls) -> AsyncIterator[_SharedSandbox]:
-        shared = _SharedSandbox()
+    async def shared(cls) -> AsyncIterator[SharedSandbox]:
+        shared = SharedSandbox()
         try:
             yield shared
         finally:
             await shared.close()
 
     @pytest.fixture
-    async def backend(self, shared: _SharedSandbox) -> IsloSandboxBackend:
+    async def backend(self, shared: SharedSandbox) -> IsloSandboxBackend:
         return await shared.get()
 
     # Destructive rules build their own sandbox, after the shared one is deleted so only one runs at a
     # time; each is deleted here if a failed rule left it behind.
     @pytest.fixture
-    async def destructive_backend(self, shared: _SharedSandbox) -> AsyncIterator[Callable[[], WorkspaceBackend]]:
+    async def destructive_backend(self, shared: SharedSandbox) -> AsyncIterator[Callable[[], WorkspaceBackend]]:
         await shared.close()
         created: list[IsloSandboxBackend] = []
 
