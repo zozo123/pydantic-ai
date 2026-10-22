@@ -150,13 +150,18 @@ async def test_timeout_kills_the_command_and_its_children(client: islo.AsyncIslo
 
 
 async def test_a_new_sandbox_gets_its_working_dir(client: islo.AsyncIslo) -> None:
-    """Validates the fake-encoded assumption that `mkdir -p` makes `working_dir` on a new sandbox, so the
-    first command starts there, and that a relative path the file API writes lands in it."""
+    """Validates the fake-encoded assumptions that `mkdir -p` makes `working_dir` on a new sandbox, so the
+    first command starts there, that a relative path the file API writes lands in it, and that the file
+    API keeps an existing file's mode, as the docs say."""
     directory = f'/workspace/{_unique("project")}/nested'
     async with _owned(client, working_dir=directory) as backend:
         assert await backend.working_dir() == directory
         await backend.write_bytes('relative.txt', b'here')
         assert (await backend.run(['cat', 'relative.txt'], timeout=60)).stdout == 'here'
+
+        assert (await backend.run(['chmod', '750', 'relative.txt'], timeout=60)).exit_code == 0
+        await backend.write_bytes('relative.txt', b'again')
+        assert (await backend.run(['stat', '-c', '%a', 'relative.txt'], timeout=60)).stdout == '750\n'
 
 
 async def test_reattach_to_a_deleted_sandbox_is_unavailable(client: islo.AsyncIslo) -> None:
