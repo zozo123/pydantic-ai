@@ -357,6 +357,7 @@ OPTIONAL_DEPENDENCIES: dict[str, str] = {
     'E2BSandbox': 'e2b',
     'ExaAgent': 'exa_py',
     'ExaSearch': 'exa_py',
+    'IsloSandbox': 'islo',
     'ModalSandbox': 'modal',
     'PlaywrightBrowser': 'playwright',
     'PromptInjectionDefender': 'stackone_defender',

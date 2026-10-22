@@ -3362,6 +3362,20 @@ wheels = [
 ]
 
 [[package]]
+name = "islo"
+version = "0.3.20"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/77/ac/b43644a438b000962fb804ab4469e2b4ba05e57548c062391bbf8ff94212/islo-0.3.20.tar.gz", hash = "sha256:3be53e9664c198aa6461344a6aca0bf635bd6ef09061783b98828428f75a5881", size = 176000, upload-time = "2026-10-12T13:12:08.818Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/60/af/73ca203878c60d68a3f26268a625aeae366348e1816ade401ffff04e8dc7/islo-0.3.20-py3-none-any.whl", hash = "sha256:4527574bef271052a6e294a89c4a3c73d2886387a8836ec690b46e7957254cbe", size = 372443, upload-time = "2026-10-12T13:12:07.122Z" },
+]
+
+[[package]]
 name = "jaraco-classes"
 version = "3.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -6645,6 +6659,9 @@ google-workspace = [
 grain = [
     { name = "pydantic-ai-slim", extra = ["mcp"] },
 ]
+islo = [
+    { name = "islo" },
+]
 linear = [
     { name = "pydantic-ai-slim", extra = ["mcp"] },
 ]
@@ -6733,6 +6750,7 @@ requires-dist = [
     { name = "genai-prices", specifier = ">=0.0.71" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "idna", marker = "extra == 'playwright'", specifier = ">=3.4" },
+    { name = "islo", marker = "extra == 'islo'", specifier = ">=0.3.20,<0.4" },
     { name = "json-repair", specifier = ">=0.58.0" },
     { name = "logfire", marker = "extra == 'logfire'", specifier = ">=4.31.0" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.5.2" },
@@ -6774,7 +6792,7 @@ requires-dist = [
     { name = "stackone-defender", extras = ["onnx"], marker = "python_full_version >= '3.11' and python_full_version < '3.15' and extra == 'prompt-injection-defender-ml'", specifier = ">=0.7.3,<0.8" },
     { name = "youdotcom", marker = "extra == 'youdotcom'", specifier = ">=3.1.2,<3.2" },
 ]
-provides-extras = ["absurd", "acp", "anthropic", "aws-lambda", "boxlite", "browser-use", "cli", "code-mode", "codemode", "coder", "day-ai", "daytona", "dbos", "dynamic-workflow", "e2b", "exa", "github", "google-workspace", "grain", "linear", "logfire", "logfire-mcp", "modal", "mongodb", "notion", "ordinal", "pgtask", "playwright", "posthog", "prompt-injection-defender", "prompt-injection-defender-ml", "pylon", "render", "researcher", "skills", "slack", "smol", "sprites", "stackone", "temporal", "youdotcom"]
+provides-extras = ["absurd", "acp", "anthropic", "aws-lambda", "boxlite", "browser-use", "cli", "code-mode", "codemode", "coder", "day-ai", "daytona", "dbos", "dynamic-workflow", "e2b", "exa", "github", "google-workspace", "grain", "islo", "linear", "logfire", "logfire-mcp", "modal", "mongodb", "notion", "ordinal", "pgtask", "playwright", "posthog", "prompt-injection-defender", "prompt-injection-defender-ml", "pylon", "render", "researcher", "skills", "slack", "smol", "sprites", "stackone", "temporal", "youdotcom"]
 
 [[package]]
 name = "pydantic-ai-slim"
