@@ -236,6 +236,9 @@ pillow = "2026-10-16T22:19:00Z"
 # boxlite 0.10.7 is the `boxlite` floor: 0.10.6 has no wheels for Python 3.13 or 3.14.
 # TODO(adtyavrdhn): Remove after 2026-10-25 01:35 UTC.
 boxlite = "2026-10-18T01:35:01Z"
+# boat-sdk 1.10.0 is the `boat-sdk` floor: it is the first release with `follow_command`'s reconnecting attach.
+# TODO(zozo123): Remove after 2026-10-26 06:43 UTC.
+boat-sdk = "2026-10-19T06:43:00Z"
 
 [dependency-groups]
 dev = [
